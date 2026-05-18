@@ -58,8 +58,11 @@ $(TMPDIR)/workload-version.config: $(TOP)/build/Versions.props
 	@mkdir -p $(TMPDIR)
 	@grep "<TizenWorkloadVersion>" build/Versions.props | sed -e 's/<\/*TizenWorkloadVersion>//g' -e 's/[ \t]*/TIZEN_WORKLOAD_VERSION=/' > $@
 
-TIZEN_VERSION_BLAME_COMMIT := $(shell git blame $(TOP)/build/Versions.props HEAD | grep "<TizenWorkloadVersion>" | sed 's/ .*//')
-TIZEN_COMMIT_DISTANCE := $(shell git log $(TIZEN_VERSION_BLAME_COMMIT)..HEAD --oneline | wc -l)
+# Note: $(strip ...) is required because BSD `wc -l` (macOS) emits leading
+# whitespace ("       9") which would otherwise sneak into target paths and
+# cause Make to split a single .nupkg target into multiple tokens.
+TIZEN_VERSION_BLAME_COMMIT := $(strip $(shell git blame HEAD -- $(TOP)/build/Versions.props 2>/dev/null | grep "<TizenWorkloadVersion>" | sed 's/ .*//'))
+TIZEN_COMMIT_DISTANCE := $(strip $(shell git log $(TIZEN_VERSION_BLAME_COMMIT)..HEAD --oneline 2>/dev/null | wc -l))
 
 CURRENT_HASH := $(shell git log -1 --pretty=%h)
 

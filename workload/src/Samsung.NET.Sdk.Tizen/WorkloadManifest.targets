@@ -1,7 +1,12 @@
 <Project>
-  <Import Project="Sdk.targets" Sdk="Samsung.Tizen.Sdk.net8" Condition=" ('$(TargetPlatformIdentifier)' == 'tizen') and ($([MSBuild]::VersionEquals($(TargetFrameworkVersion), '8.0')))" />
-  <Import Project="Sdk.targets" Sdk="Samsung.Tizen.Sdk.net7" Condition=" ('$(TargetPlatformIdentifier)' == 'tizen') and ($([MSBuild]::VersionEquals($(TargetFrameworkVersion), '7.0')))" />
-  <Import Project="Sdk.targets" Sdk="Samsung.Tizen.Sdk.net6" Condition=" ('$(TargetPlatformIdentifier)' == 'tizen') and ($([MSBuild]::VersionEquals($(TargetFrameworkVersion), '6.0')))" />
+  <!--
+    Single SDK pack imported for every TFM (net6.0/net7.0/net8.0+) on Tizen.
+    Per-TFM divergence used to be handled by alias packs Samsung.Tizen.Sdk.netX;
+    they were dropped during the "single SDK + per-API ref" refactor. The new
+    Samsung.Tizen.Sdk.Versions.targets handles TargetPlatformVersion branching
+    via KnownFrameworkReference conditions.
+  -->
+  <Import Project="Sdk.targets" Sdk="Samsung.Tizen.Sdk" Condition=" '$(TargetPlatformIdentifier)' == 'tizen' " />
 
   <ItemGroup Condition=" '$(TargetFrameworkIdentifier)' == '.NETCoreApp' and $([MSBuild]::VersionGreaterThanOrEquals($(TargetFrameworkVersion), '6.0')) ">
     <SdkSupportedTargetPlatformIdentifier Include="tizen" DisplayName="Tizen" />

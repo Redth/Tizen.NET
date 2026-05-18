@@ -78,4 +78,8 @@ core workload sdk pack imported by the Samsung.NET.Sdk.Tizen.
     </PropertyGroup>
     <ItemGroup>
       <_PackageFiles Include="$(BuildTasksOutputPath)Samsung.Tizen.Build.Tasks.dll" PackagePath="tools" />
-      <_PackageFiles Include="$(BuildTasksOutputPath)Boun
+      <_PackageFiles Include="$(BuildTasksOutputPath)BouncyCastle.Crypto.dll" PackagePath="tools" />
+    </ItemGroup>
+  </Target>
+
+</Project>

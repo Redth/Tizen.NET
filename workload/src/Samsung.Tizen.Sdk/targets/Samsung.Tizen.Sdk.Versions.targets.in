@@ -96,4 +96,9 @@ Copyright (c) Samsung All rights reserved.
       Include="Samsung.Tizen"
       TargetFramework="$(_TargetFramework)"
       TargetingPackName="Samsung.Tizen.Ref.API15"
-      Tar
+      TargetingPackVersion="@TizenFXAPI15Version@"
+      Profile="Tizen"
+    />
+  </ItemGroup>
+
+</Project>
