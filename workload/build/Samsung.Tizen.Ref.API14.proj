@@ -55,7 +55,10 @@ by projects that use the Tizen .NET framework in .NET 5.
 
     <ItemGroup>
       <_TizenFXNugetPathItem Include="$(TizenFXNuGetPathVariable)" />
-      <_TizenRefPackAssemblies Include="$(%(_TizenFXNugetPathItem.Identity))\ref\net8.0\*.dll" />
+      <!-- Tizen.NET.API14 published its ref assemblies under ref/net6.0/ (not net8.0/).
+           Pull from that source path; the produced pack's ref/ path below is still net8.0
+           because consumers build net8.0-tizen10.1 TFM. -->
+      <_TizenRefPackAssemblies Include="$(%(_TizenFXNugetPathItem.Identity))\ref\net6.0\*.dll" />
       <FrameworkListFileClass Include="@(_TizenRefPackAssemblies->'%(Filename)%(Extension)')" Profile="Tizen" />
     </ItemGroup>
 

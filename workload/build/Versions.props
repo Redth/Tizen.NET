@@ -25,7 +25,7 @@
     <TizenFXAPI11Version>11.0.0.18033</TizenFXAPI11Version>
     <TizenFXAPI12Version>12.0.0.18510</TizenFXAPI12Version>
     <TizenFXAPI13Version>13.0.0.19198</TizenFXAPI13Version>
-    <TizenFXAPI14Version>14.0.0.19301</TizenFXAPI14Version>
+    <TizenFXAPI14Version>14.0.0.19302</TizenFXAPI14Version>
     <TizenFXAPI15Version>15.0.0.19372</TizenFXAPI15Version>
   </PropertyGroup>
 
