@@ -62,4 +62,5 @@ jobs:
         dotnet nuget push ./workload/out/nuget-unsigned/Samsung.*.nupkg \
                       -k ${{ secrets.NUGET_APIKEY }} \
                       -s https://api.nuget.org/v3/index.json \
-                      -t 3000
+                      -t 3000 \
+                      --skip-duplicate
