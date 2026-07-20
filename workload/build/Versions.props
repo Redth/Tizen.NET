@@ -30,7 +30,7 @@
     <TizenFXAPI12Version>12.0.0.18510</TizenFXAPI12Version>
     <TizenFXAPI13Version>13.0.0.19231</TizenFXAPI13Version>
     <TizenFXAPI14Version>14.0.0.19300</TizenFXAPI14Version>
-    <TizenFXAPI15Version>15.0.0.19371</TizenFXAPI15Version>
+    <TizenFXAPI15Version>15.0.0.19396</TizenFXAPI15Version>
   </PropertyGroup>
 
   <!--
