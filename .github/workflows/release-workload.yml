@@ -18,7 +18,7 @@ on:
         default: true
 
 permissions:
-  contents: read
+  contents: write
   packages: read
 
 jobs:
@@ -38,6 +38,7 @@ jobs:
           --configfile workload/NuGet.config
 
     - name: Bump TizenWorkloadVersion (global sequential, NuGet-derived)
+      id: bump
       working-directory: ./workload
       run: |
         set -e
@@ -50,6 +51,7 @@ jobs:
             exit 1
         fi
         python3 scripts/next-workload-version.py --apply --verbose
+        echo "workload_version=$NEW" >> "$GITHUB_OUTPUT"
         echo "::notice ::Bumped TizenWorkloadVersion: $OLD -> $NEW"
 
     - name: Install Wix toolset
@@ -96,3 +98,32 @@ jobs:
                       -s https://api.nuget.org/v3/index.json \
                       -t 3000 \
                       --skip-duplicate
+
+    - name: Create GitHub Release
+      if: ${{ github.event.inputs.release_manifest == 'true' }}
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        VER="${{ steps.bump.outputs.workload_version }}"
+        SDK="${{ github.event.inputs.net_sdk_version }}"
+        BAND="${SDK%%-*}"
+        MAJOR_MINOR="$(echo "$BAND" | cut -d. -f1-2)"
+        {
+          echo "### Target .NET SDK: .NET ${SDK}"
+          echo ""
+          echo "## NuGet Packages"
+          echo ""
+          echo "- https://www.nuget.org/packages/Samsung.NET.Sdk.Tizen.Manifest-${BAND}/${VER}"
+          echo "- https://www.nuget.org/packages/Samsung.NETCore.App.Runtime.tizen/${VER}"
+          echo "- https://www.nuget.org/packages/Samsung.Tizen.Sdk/${VER}"
+          echo "- https://www.nuget.org/packages/Samsung.Tizen.Templates/${VER}"
+          for api in 11 12 13 14 15; do
+            v=$(grep -oP "(?<=<TizenFXAPI${api}Version>)[^<]+" workload/build/Versions.props || true)
+            [ -n "$v" ] && echo "- https://www.nuget.org/packages/Samsung.Tizen.Ref.API${api}/${v}"
+          done
+        } > "$RUNNER_TEMP/release-notes.md"
+        gh release create "v${VER}" \
+          --target "${GITHUB_REF_NAME}" \
+          --title "Tizen Workload ${VER} - .Net ${MAJOR_MINOR}" \
+          --notes-file "$RUNNER_TEMP/release-notes.md" \
+          --generate-notes
