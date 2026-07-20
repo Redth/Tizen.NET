@@ -9,12 +9,12 @@ else
 	@echo "DOTNET_VERSION=$(DOTNET_VERSION)" > $@
 endif
 
-# Temporal Workaround to set versions manually.
-TizenFXAPI11Version=11.0.0.18033
-TizenFXAPI12Version=12.0.0.18510
-TizenFXAPI13Version=13.0.0.19231
-TizenFXAPI14Version=14.0.0.19300
-TizenFXAPI15Version=15.0.0.19396
+# TizenFX API versions per API level — auto-extracted from Versions.props (SSOT)
+-include $(TMPDIR)/tizen-fx-api-versions.config
+$(TMPDIR)/tizen-fx-api-versions.config: $(TOP)/build/Versions.props
+	@mkdir -p $(TMPDIR)
+	@grep -oE '<TizenFXAPI[0-9]+Version>[^<]+' build/Versions.props \
+	  | sed -E 's/<TizenFXAPI([0-9]+)Version>/TizenFXAPI\1Version=/' > $@
 
 $(info DOTNET_VERSION is.. $(DOTNET_VERSION))
 
