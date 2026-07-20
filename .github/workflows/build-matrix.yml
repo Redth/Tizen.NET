@@ -60,6 +60,14 @@ jobs:
       with:
         fetch-depth: 0
 
+    - name: Authenticate GitHub Packages NuGet source
+      run: |
+        dotnet nuget update source github \
+          --username github-actions \
+          --password ${{ secrets.GITHUB_TOKEN }} \
+          --store-password-in-clear-text \
+          --configfile workload/NuGet.config
+
     - name: Run make test-matrix
       env:
         PULLREQUEST_ID: ${{ github.event.number }}
