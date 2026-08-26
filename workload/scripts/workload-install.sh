@@ -165,10 +165,37 @@ if [ ! -x "$DOTNET_COMMAND" ]; then
     exit 1
 fi
 
+# BEGIN VERSION BAND DETECTION -- covered by scripts/test-version-band.sh
+# Map a full .NET SDK version to the SDK feature band used for the workload
+# manifest directory / NuGet package suffix.
+#   10.0.100                     -> 10.0.100
+#   10.0.100-rc.2.25502.107      -> 10.0.100-rc.2
+#   11.0.100-preview.7.26381.103 -> 11.0.100-preview.7
+#   8.0.100-rtm.23512.16         -> 8.0.100-rtm
+#   6.0.419                      -> 6.0.400   (pre-net7 SDKs have no preview bands)
+function compute_target_version_band() {
+    local dotnet_version="$1"
+    local -a array
+    IFS='.' read -r -a array <<< "$dotnet_version"
+    local current_major="${array[0]}"
+    local band="${array[0]}.${array[1]}.${array[2]:0:1}00"
+
+    if [[ "$current_major" -ge "7" ]]; then
+        if [[ "$dotnet_version" == *"-preview"* || "$dotnet_version" == *"-rc"* || "$dotnet_version" == *"-alpha"* ]] && [[ ${#array[@]} -ge 4 ]]; then
+            echo "$band${array[2]:3}.${array[3]}"
+            return
+        elif [[ "$dotnet_version" == *"-rtm"* ]] && [[ ${#array[@]} -ge 3 ]]; then
+            echo "$band${array[2]:3}"
+            return
+        fi
+    fi
+    echo "$band"
+}
+# END VERSION BAND DETECTION
+
 function install_tizenworkload() {
     DOTNET_VERSION=$1
     IFS='.' read -r -a array <<< "$DOTNET_VERSION"
-    CURRENT_DOTNET_VERSION=${array[0]}
     DOTNET_VERSION_BAND="${array[0]}.${array[1]}.${array[2]:0:1}00"
     MANIFEST_NAME="$MANIFEST_BASE_NAME-$DOTNET_VERSION_BAND"
 
@@ -180,19 +207,8 @@ function install_tizenworkload() {
 
     # Check version band
     if [[ "$DOTNET_TARGET_VERSION_BAND" == "<auto>" ]]; then
-        if [[ "$CURRENT_DOTNET_VERSION" -ge "7" ]]; then
-            if [[ "$DOTNET_VERSION" == *"-preview"* || $DOTNET_VERSION == *"-rc"* || $DOTNET_VERSION == *"-alpha"* ]] && [[ ${#array[@]} -ge 4 ]]; then
-                DOTNET_TARGET_VERSION_BAND="$DOTNET_VERSION_BAND${array[2]:3}.${array[3]}"
-                MANIFEST_NAME="$MANIFEST_BASE_NAME-$DOTNET_TARGET_VERSION_BAND"
-            elif [[ "$DOTNET_VERSION" == *"-rtm"* ]] && [[ ${#array[@]} -ge 3 ]]; then
-                DOTNET_TARGET_VERSION_BAND="$DOTNET_VERSION_BAND${array[2]:3}"
-                MANIFEST_NAME="$MANIFEST_BASE_NAME-$DOTNET_TARGET_VERSION_BAND"
-            else
-                DOTNET_TARGET_VERSION_BAND=$DOTNET_VERSION_BAND
-            fi
-        else
-            DOTNET_TARGET_VERSION_BAND=$DOTNET_VERSION_BAND
-        fi
+        DOTNET_TARGET_VERSION_BAND=$(compute_target_version_band "$DOTNET_VERSION")
+        MANIFEST_NAME="$MANIFEST_BASE_NAME-$DOTNET_TARGET_VERSION_BAND"
     fi
 
     # Check latest version of manifest.
@@ -258,7 +274,7 @@ function install_tizenworkload() {
 }
 
 if [[ "$UPDATE_ALL_WORKLOADS" == "true" ]]; then
-    INSTALLED_DOTNET_SDKS=$($DOTNET_COMMAND --list-sdks | sed -n '/^6\|^7/p' | sed 's/ \[.*//g')
+    INSTALLED_DOTNET_SDKS=$($DOTNET_COMMAND --list-sdks | sed -E -n '/^([6-9]|[1-9][0-9]+)\./p' | sed 's/ \[.*//g')
 else
     INSTALLED_DOTNET_SDKS=$($DOTNET_COMMAND --version)
 fi
@@ -266,4 +282,10 @@ fi
 if [ -z "$INSTALLED_DOTNET_SDKS" ]; then
     echo ".NET SDK version 6 or later is required to install Tizen Workload."
 else
-    for DOTNET_SDK in $INSTALLED_DOTNET_SD                                                                                                                                      
+    for DOTNET_SDK in $INSTALLED_DOTNET_SDKS; do
+        echo "Check Tizen Workload for sdk $DOTNET_SDK."
+        install_tizenworkload $DOTNET_SDK
+    done
+fi
+
+echo "DONE"

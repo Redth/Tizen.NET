@@ -304,7 +304,7 @@ if (Get-Command $DotnetCommand -ErrorAction SilentlyContinue)
 {
     if ($UpdateAllWorkloads.IsPresent)
     {
-        $InstalledDotnetSdks = Invoke-Expression "& '$DotnetCommand' --list-sdks | Select-String -Pattern '^6|^7'" | ForEach-Object {$_ -replace (" \[.*","")}
+        $InstalledDotnetSdks = Invoke-Expression "& '$DotnetCommand' --list-sdks | Select-String -Pattern '^([6-9]|[1-9][0-9]+)\.'" | ForEach-Object {$_ -replace (" \[.*","")}
     }
     else
     {
@@ -329,4 +329,11 @@ else
             Install-TizenWorkload -DotnetVersion $DotnetSdk
         }
         catch {
-            Write-Host 
+            Write-Host "Failed to install Tizen Workload for sdk $DotnetSdk"
+            Write-Host "$_"
+            Continue
+        }
+    }
+}
+
+Write-Host "`nDone"
