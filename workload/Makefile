@@ -141,6 +141,21 @@ test-matrix: install
 		bash $(TOP)/scripts/test-matrix.sh
 
 
+# Static checks that need no dotnet install: cross-file metadata consistency and
+# the SDK feature-band detection shared by both install scripts.
+.PHONY: validate-metadata
+validate-metadata:
+	@python3 $(TOP)/scripts/validate-workload-metadata.py
+
+.PHONY: test-version-band
+test-version-band:
+	@bash $(TOP)/scripts/test-version-band.sh
+
+.PHONY: check
+check: validate-metadata test-version-band
+	@pwsh $(TOP)/scripts/Generate-InstallScripts.ps1 -Check
+
+
 # Remove artifacts and temporary files
 clean:
 	@rm -fr $(OUTDIR)

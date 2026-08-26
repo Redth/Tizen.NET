@@ -51,6 +51,34 @@ To add or update an entry:
 The CI workflow `validate-version-map.yml` runs `Generate-InstallScripts.ps1 -Check`
 on every PR and fails if the two scripts have drifted from `version-map.json`.
 
+### When *not* to add an entry
+
+`LatestVersionMap` is a **fallback cache of already-published manifest versions**. It is only
+consulted when the live NuGet lookup fails. Adding an entry for an SDK band whose
+`Samsung.NET.Sdk.Tizen.Manifest-<band>` package has never been released makes the installer
+download a 404. Add the entry *after* the release, not before — see commit
+`chore: add 10.0.300 -> 10.0.127 to version map`.
+
+## test-version-band
+
+`Generate-InstallScripts.ps1 -Check` only compares the generated version-map block, so it cannot
+see problems elsewhere in the installers. Two extra guards cover that gap:
+
+* [`test-version-band.sh`](./test-version-band.sh) asserts the SDK-version → feature-band mapping
+  (for example `11.0.100-preview.7.26381.103` → `11.0.100-preview.7`) and checks that
+  `workload-install.sh` and `workload-install.ps1` agree. The bash implementation is extracted
+  live from `workload-install.sh` between the `BEGIN/END VERSION BAND DETECTION` markers, so the
+  test always exercises shipped code — keep those markers intact.
+* `Generate-InstallScripts.ps1` additionally verifies both installers contain no NUL bytes and
+  end with their expected final statement. Both scripts had previously been committed truncated
+  mid-statement and NUL-padded, which the version-map drift check reported as "OK".
+
+Run everything at once with:
+
+```
+make -C workload check
+```
+
 ### Why
 
 Previously, the same ~36 entries were maintained by hand in two different languages

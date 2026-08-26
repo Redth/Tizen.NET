@@ -14,6 +14,9 @@ Validates that the following stay in sync:
   workload/src/Samsung.Tizen.Sdk/targets/Samsung.Tizen.Sdk.Versions.targets.in
   workload/src/Samsung.NET.Sdk.Tizen/WorkloadManifest.in.json
   workload/scripts/test-matrix.sh
+  workload/src/Samsung.Tizen.Sdk/targets/Samsung.Tizen.Sdk.targets
+  workload/src/Samsung.NETCore.App.Runtime/data/RuntimeList.xml
+  workload/src/Samsung.Tizen.Templates/tizen/.template.config/template.json
 
 Checks:
   C1  Versions.targets.in sigils all have matching Versions.props property
@@ -23,6 +26,11 @@ Checks:
   C3  TizenSdkSupportedTargetPlatformVersion ↔ KnownFrameworkReference
       consistency in Versions.targets.in.
   C4  test-matrix.sh MATRIX uses only supported platforms.
+  C5  Every .NET major offered by the template / exercised by test-matrix.sh has a
+      matching KnownRuntimePack in Samsung.Tizen.Sdk.targets. Without it the SDK
+      cannot resolve Samsung.NETCore.App.Runtime.tizen and the build fails with
+      NETSDK1082 ("no runtime pack available").
+  C6  Every KnownRuntimePack .NET major has a FileList row in RuntimeList.xml.
 
 Run from anywhere — paths derive from this script's location.
 
@@ -85,6 +93,9 @@ def main() -> int:
     versions_in = read("src/Samsung.Tizen.Sdk/targets/Samsung.Tizen.Sdk.Versions.targets.in")
     workload_in = read("src/Samsung.NET.Sdk.Tizen/WorkloadManifest.in.json")
     matrix_sh = read("scripts/test-matrix.sh")
+    sdk_targets = read("src/Samsung.Tizen.Sdk/targets/Samsung.Tizen.Sdk.targets")
+    runtime_list = read("src/Samsung.NETCore.App.Runtime/data/RuntimeList.xml")
+    template_json = read("src/Samsung.Tizen.Templates/tizen/.template.config/template.json")
 
     sdk_repl = parse_replacements(sdk_proj)
     manifest_repl = parse_replacements(manifest_proj)
@@ -161,6 +172,49 @@ def main() -> int:
         err("C4: test-matrix.sh uses unsupported platform(s): " + str(sorted(unknown_plats)))
     else:
         ok("C4: test-matrix.sh (" + str(len(matrix_entries)) + " rows) all platforms supported")
+
+    # --- C5 ---
+    # KnownRuntimePack is keyed by the .NET major TFM (net8.0, net10.0, ...).
+    # A TFM the template can produce but the SDK has no runtime pack for fails at
+    # build time, so both producers of TFMs must be covered.
+    krp_tfms = set(
+        re.findall(r'<KnownRuntimePack\b[^>]*?\n?[^>]*?TargetFramework="(net[\d.]+)"', sdk_targets)
+    )
+    if not krp_tfms:
+        # Attribute order/newlines vary; fall back to a per-element scan.
+        for block in re.findall(r"<KnownRuntimePack\b.*?/>", sdk_targets, re.S):
+            m = re.search(r'TargetFramework="(net[\d.]+)"', block)
+            if m:
+                krp_tfms.add(m.group(1))
+
+    template_netvers = set(re.findall(r'"choice":\s*"(net[\d.]+)"', template_json))
+    matrix_netvers = {tfm.split("-tizen", 1)[0] for tfm, _api in matrix_entries}
+    required_netvers = template_netvers | matrix_netvers
+
+    missing_krp = sorted(required_netvers - krp_tfms, key=lambda v: float(v[3:]))
+    if not krp_tfms:
+        err("C5: no KnownRuntimePack entries parsed from Samsung.Tizen.Sdk.targets")
+    elif missing_krp:
+        err("C5: no KnownRuntimePack for " + str(missing_krp) +
+            " (offered by template.json / test-matrix.sh). Add a KnownRuntimePack "
+            "entry in Samsung.Tizen.Sdk.targets or the build fails with NETSDK1082.")
+    else:
+        ok("C5: template/test-matrix .NET majors (" + str(len(required_netvers)) +
+           ") all have a KnownRuntimePack")
+
+    # --- C6 ---
+    runtime_list_vers = {
+        "net" + v for v in re.findall(r'TargetFrameworkVersion="([\d.]+)"', runtime_list)
+    }
+    missing_rl = sorted(krp_tfms - runtime_list_vers, key=lambda v: float(v[3:])) if krp_tfms else []
+    if not runtime_list_vers:
+        err("C6: no FileList rows parsed from Samsung.NETCore.App.Runtime/data/RuntimeList.xml")
+    elif missing_rl:
+        err("C6: RuntimeList.xml has no FileList row for " + str(missing_rl) +
+            " but a KnownRuntimePack declares it.")
+    else:
+        ok("C6: KnownRuntimePack majors (" + str(len(krp_tfms)) +
+           ") all present in RuntimeList.xml")
 
     print()
     if errors:

@@ -54,4 +54,14 @@
   <PropertyGroup Condition="$(MicrosoftDotnetSdkInternalPackageVersion.StartsWith('10.0'))">
     <MicrosoftDotNetBuildTasksFeedPackageVersion>10.0.0-beta.25531.102</MicrosoftDotNetBuildTasksFeedPackageVersion>
   </PropertyGroup>
+
+  <!--
+    .NET 11 is still in preview (latest SDK at time of writing: 11.0.100-preview.7.26381.103).
+    Build a .NET 11 band manifest with:
+        make packs DOTNET_VERSION=11.0.100-preview.7.26381.103
+    which produces Samsung.NET.Sdk.Tizen.Manifest-11.0.100-preview.7.
+  -->
+  <PropertyGroup Condition="$(MicrosoftDotnetSdkInternalPackageVersion.StartsWith('11.0'))">
+    <MicrosoftDotNetBuildTasksFeedPackageVersion>11.0.0-beta.26426.103</MicrosoftDotNetBuildTasksFeedPackageVersion>
+  </PropertyGroup>
 </Project>

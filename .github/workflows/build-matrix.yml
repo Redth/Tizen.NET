@@ -17,6 +17,7 @@ on:
     branches:
     - main
     - net10.0
+    - net11.0
     paths:
     - 'workload/**'
     - '.github/workflows/build-matrix.yml'
@@ -24,6 +25,7 @@ on:
     branches:
     - main
     - net10.0
+    - net11.0
     paths:
     - 'workload/**'
     - '.github/workflows/build-matrix.yml'
@@ -51,10 +53,28 @@ jobs:
     - name: Run validate-workload-metadata.py
       run: python3 workload/scripts/validate-workload-metadata.py
 
+    - name: Run test-version-band.sh
+      run: bash workload/scripts/test-version-band.sh
+
   test-matrix:
-    name: Multi-TFM build matrix
+    name: Multi-TFM build matrix (${{ matrix.name }})
     needs: validate-metadata
     runs-on: ubuntu-22.04
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Shipping band. Blocking.
+          - name: .NET 10
+            dotnet_version: ''
+            experimental: false
+          # .NET 11 is still a preview SDK band, so a failure here must not block
+          # merges to the .NET 10 branch. It builds the workload against the .NET 11
+          # SDK and runs the net11.0-* matrix rows end to end.
+          - name: .NET 11 preview
+            dotnet_version: '11.0.100-preview.7.26381.103'
+            experimental: true
     steps:
     - uses: actions/checkout@v3
       with:
@@ -71,6 +91,7 @@ jobs:
     - name: Run make test-matrix
       env:
         PULLREQUEST_ID: ${{ github.event.number }}
+        DOTNET_VERSION: ${{ matrix.dotnet_version }}
       working-directory: ./workload
       run: make test-matrix
 
@@ -78,7 +99,7 @@ jobs:
       if: failure()
       uses: actions/upload-artifact@v4
       with:
-        name: test-matrix-logs
+        name: test-matrix-logs-${{ matrix.name }}
         path: |
           workload/.tmp/matrix/**/build.log
           workload/.tmp/matrix/**/dotnet-new.log

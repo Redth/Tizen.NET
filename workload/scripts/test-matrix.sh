@@ -37,11 +37,19 @@ ONLY="${TEST_MATRIX_ONLY:-}"
 #   A single shared fixture can't build both eras, so they are excluded here.
 #   Add coverage in a follow-up by introducing a separate legacy fixture
 #   (e.g. workload/scripts/fixtures/legacy/) keyed off the row's TFM.
+#
+# NOTE on net11.0-*:
+#   .NET 11 is a preview SDK band. A row is SKIPPED (not failed) when the dotnet
+#   under test cannot build that .NET major, so the default `make test-matrix`
+#   run against the .NET 10 band stays green. To exercise these rows:
+#       make test-matrix DOTNET_VERSION=11.0.100-preview.7.26381.103
 MATRIX=(
     "net8.0-tizen10.0|10"
     "net8.0-tizen10.1|10.1"
     "net8.0-tizen11.0|11"
     "net9.0-tizen10.0|10"
+    "net11.0-tizen11.0|11"
+    "net11.0-tizen10.0|10"
 )
 
 # --- helpers ---------------------------------------------------------------
@@ -53,6 +61,24 @@ log()    { printf "%s\n" "$*"; }
 pass()   { printf "  %sPASS%s  %s\n" "$c_green" "$c_reset" "$*"; }
 fail()   { printf "  %sFAIL%s  %s\n" "$c_red"   "$c_reset" "$*"; }
 warn()   { printf "  %sWARN%s  %s\n" "$c_yellow" "$c_reset" "$*"; }
+skip()   { printf "  %sSKIP%s  %s\n" "$c_yellow" "$c_reset" "$*"; }
+
+# Major versions of the .NET SDKs visible to $DOTNET, e.g. "8 9 10".
+# Populated once, after the $DOTNET prerequisite check below.
+INSTALLED_SDK_MAJORS=""
+
+# sdk_supports <netver>   e.g. sdk_supports net11.0
+# An SDK can only build a TFM whose .NET major it ships, so a net11.0 row needs
+# an 11.x SDK. Returns non-zero when unavailable so the row can be skipped.
+sdk_supports() {
+    local netver="$1"
+    local want="${netver#net}"; want="${want%%.*}"
+    local have
+    for have in $INSTALLED_SDK_MAJORS; do
+        [[ "$have" == "$want" ]] && return 0
+    done
+    return 1
+}
 
 # --- prerequisites ---------------------------------------------------------
 
@@ -71,10 +97,15 @@ fi
 
 mkdir -p "$TMPDIR"
 
+# Discover which .NET majors this dotnet can build for.
+INSTALLED_SDK_MAJORS="$("$DOTNET" --list-sdks 2>/dev/null | sed -E 's/^([0-9]+)\..*/\1/' | sort -un | tr '\n' ' ')"
+log "Installed .NET SDK majors: ${INSTALLED_SDK_MAJORS:-<none detected>}"
+
 # --- matrix loop -----------------------------------------------------------
 
-declare -i pass_count=0 fail_count=0
+declare -i pass_count=0 fail_count=0 skip_count=0
 declare -a failed_rows=()
+declare -a skipped_rows=()
 
 for entry in "${MATRIX[@]}"; do
     tfm="${entry%%|*}"
@@ -84,12 +115,19 @@ for entry in "${MATRIX[@]}"; do
         continue
     fi
 
-    netver="${tfm%-tizen*}"      # net6.0 / net8.0 / net9.0
-    platver="${tfm##*-tizen}"    # 8.0 / 9.0 / 10.0 / 11.0
+    netver="${tfm%-tizen*}"      # net6.0 / net8.0 / net9.0 / net11.0
+    platver="${tfm##*-tizen}"    # 8.0 / 9.0 / 10.0 / 10.1 / 11.0
     rowdir="$TMPDIR/$tfm"
 
     log ""
     log "==> [$tfm] api-version=$apiver"
+
+    if ! sdk_supports "$netver"; then
+        skip "$tfm  (no ${netver} SDK installed; rerun with DOTNET_VERSION=<${netver#net} sdk>)"
+        skip_count+=1
+        skipped_rows+=("$tfm")
+        continue
+    fi
 
     rm -rf "$rowdir"
     mkdir -p "$rowdir"
@@ -157,6 +195,14 @@ log ""
 log "================ test-matrix summary ================"
 log "  passed:  $pass_count"
 log "  failed:  $fail_count"
+log "  skipped: $skip_count"
+
+if [[ $skip_count -gt 0 ]]; then
+    log "  skipped rows:"
+    for r in "${skipped_rows[@]}"; do
+        log "    - $r"
+    done
+fi
 
 if [[ $fail_count -gt 0 ]]; then
     log "  failed rows:"
