@@ -1,9 +1,8 @@
+#!/bin/bash -e
 #
 # Copyright (c) Samsung Electronics. All rights reserved.
 # Licensed under the MIT license. See LICENSE file in the project root for full license information.
 #
-
-#!/bin/bash -e
 
 MANIFEST_BASE_NAME="samsung.net.sdk.tizen.manifest"
 MANIFEST_VERSION="<latest>"
@@ -143,9 +142,17 @@ function getLatestVersion () {
              return
          fi
     done
-    # return fallback version
+    # Return a fallback version, but only from the SAME .NET major.minor family.
+    # '<base>-11.0.100-preview.7' -> '<base>-11.0.' so an 11.x request can never
+    # resolve to a 10.x manifest. Must match Get-BandFamilyPrefix in workload-install.ps1.
     local manifestId="$1"
-    local prefix="${manifestId%.*}"
+    local family="${manifestId#*-}"
+    family="$(echo "$family" | sed -E 's/^([0-9]+\.[0-9]+)\..*/\1/')"
+    if [[ ! "$family" =~ ^[0-9]+\.[0-9]+$ ]]; then
+        echo ""
+        return
+    fi
+    local prefix="${manifestId%%-*}-${family}."
     local fallbackVersion=""
     for entry in "${LatestVersionMap[@]}"; do
         mapKey="${entry%%=*}"
@@ -220,7 +227,7 @@ function install_tizenworkload() {
                 echo "Return cached latest version: $MANIFEST_VERSION"
             else
                 echo "Failed to get the latest version of $MANIFEST_NAME."
-                return
+                return 1
             fi
         fi
     fi
@@ -239,7 +246,8 @@ function install_tizenworkload() {
     unzip -qq -d $TMPDIR/unzipped $TMPDIR/manifest.zip
     if [ ! -d $TMPDIR/unzipped/data ]; then
         echo "No such files to install."
-        return
+        rm -fr $TMPDIR
+        return 1
     fi
     chmod 744 $TMPDIR/unzipped/data/*
 
@@ -249,7 +257,8 @@ function install_tizenworkload() {
 
     if [ ! -f $SDK_MANIFESTS_DIR/samsung.net.sdk.tizen/WorkloadManifest.json ]; then
         echo "Installation is failed."
-        return
+        rm -fr $TMPDIR
+        return 1
     fi
 
     # Install workload packs.
@@ -261,12 +270,18 @@ function install_tizenworkload() {
     fi
     dotnet new globaljson --sdk-version $DOTNET_VERSION
     $DOTNET_INSTALL_DIR/dotnet workload install tizen --skip-manifest-update
+    local install_status=$?
 
     # Clean-up
     rm -fr $TMPDIR
     rm global.json
     if [[ "$CACHE_GLOBAL_JSON" == "true" ]]; then
         mv global.json.bak global.json
+    fi
+
+    if [ $install_status -ne 0 ]; then
+        echo "Failed to install Tizen workload packs for $DOTNET_VERSION (exit $install_status)."
+        return $install_status
     fi
 
     echo "Done installing Tizen workload $MANIFEST_VERSION"
@@ -279,13 +294,23 @@ else
     INSTALLED_DOTNET_SDKS=$($DOTNET_COMMAND --version)
 fi
 
+FAILED_SDKS=""
+
 if [ -z "$INSTALLED_DOTNET_SDKS" ]; then
     echo ".NET SDK version 6 or later is required to install Tizen Workload."
-else
-    for DOTNET_SDK in $INSTALLED_DOTNET_SDKS; do
-        echo "Check Tizen Workload for sdk $DOTNET_SDK."
-        install_tizenworkload $DOTNET_SDK
-    done
+    exit 1
+fi
+
+for DOTNET_SDK in $INSTALLED_DOTNET_SDKS; do
+    echo "Check Tizen Workload for sdk $DOTNET_SDK."
+    if ! install_tizenworkload $DOTNET_SDK; then
+        FAILED_SDKS="$FAILED_SDKS $DOTNET_SDK"
+    fi
+done
+
+if [ -n "$FAILED_SDKS" ]; then
+    echo "FAILED to install Tizen workload for sdk(s):$FAILED_SDKS"
+    exit 1
 fi
 
 echo "DONE"

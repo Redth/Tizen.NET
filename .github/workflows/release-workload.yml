@@ -57,33 +57,69 @@ jobs:
     - name: Install Wix toolset
       run: sudo apt-get install -y wixl
 
+    # A release must never publish a half-built or stale set of packages. The tree is
+    # cleaned first so the output directory can only contain this run's artifacts, and
+    # the build is NOT continue-on-error: a failed build must abort the release.
+    - name: Clean previous output
+      run: make clean
+      working-directory: ./workload
+
     - name: Build
       env:
         PRERELEASE_TAG: "stable"
       run: make install -d DOTNET_VERSION=${{ github.event.inputs.net_sdk_version }}
       working-directory: ./workload
-      continue-on-error: true
+
+    # Stage into an isolated directory and verify the expected artifacts exist, so the
+    # push steps operate on an explicit, audited list rather than a glob over whatever
+    # happens to be on disk.
+    - name: Stage and verify packages
+      id: stage
+      run: |
+        set -euo pipefail
+        STAGING="$RUNNER_TEMP/staging"
+        rm -rf "$STAGING" && mkdir -p "$STAGING"
+        shopt -s nullglob
+        pkgs=(./workload/out/nuget-unsigned/*.nupkg)
+        if [ ${#pkgs[@]} -eq 0 ]; then
+          echo "::error::Build produced no packages."
+          exit 1
+        fi
+        cp "${pkgs[@]}" "$STAGING/"
+        SDK="${{ github.event.inputs.net_sdk_version }}"
+        # Reuse the band function from workload-install.sh so the release cannot
+        # disagree with what the installer will look for.
+        eval "$(sed -n '/# BEGIN VERSION BAND DETECTION/,/# END VERSION BAND DETECTION/p' workload/scripts/workload-install.sh)"
+        BAND="$(compute_target_version_band "$SDK")"
+        echo "Resolved SDK feature band: $BAND"
+        if ! ls "$STAGING/Samsung.NET.Sdk.Tizen.Manifest-$BAND."*.nupkg >/dev/null 2>&1; then
+          echo "::error::No Samsung.NET.Sdk.Tizen.Manifest-$BAND package was produced."
+          ls -1 "$STAGING"
+          exit 1
+        fi
+        echo "staging=$STAGING" >> "$GITHUB_OUTPUT"
+        echo "Staged packages:"; ls -1 "$STAGING"
 
     - name: Push Manifest/SDK/Runtime packs
       if: ${{ github.event.inputs.release_manifest == 'true' }}
       run: |
         echo "Pushing Manifest packs for version ${{ github.event.inputs.net_sdk_version }}"...
-        dotnet nuget push ./workload/out/nuget-unsigned/Samsung.NET.Sdk.Tizen.Manifest-*.nupkg \
+        dotnet nuget push ${{ steps.stage.outputs.staging }}/Samsung.NET.Sdk.Tizen.Manifest-*.nupkg \
                       -k ${{ secrets.NUGET_APIKEY }} \
                       -s https://api.nuget.org/v3/index.json \
                       -t 3000 \
                       --skip-duplicate
-        dotnet nuget push ./workload/out/nuget-unsigned/Samsung.Tizen.Sdk.*.nupkg \
+        dotnet nuget push ${{ steps.stage.outputs.staging }}/Samsung.Tizen.Sdk.*.nupkg \
                       -k ${{ secrets.NUGET_APIKEY }} \
                       -s https://api.nuget.org/v3/index.json \
                       -t 3000 \
                       --skip-duplicate
-        dotnet nuget push ./workload/out/nuget-unsigned/Samsung.NETCore.App.Runtime.*.nupkg \
+        dotnet nuget push ${{ steps.stage.outputs.staging }}/Samsung.NETCore.App.Runtime.*.nupkg \
                       -k ${{ secrets.NUGET_APIKEY }} \
                       -s https://api.nuget.org/v3/index.json \
                       -t 3000 \
                       --skip-duplicate
-        dotnet nuget push ./workload/out/nuget-unsigned/Samsung.Tizen.Templates.*.nupkg \
+        dotnet nuget push ${{ steps.stage.outputs.staging }}/Samsung.Tizen.Templates.*.nupkg \
                       -k ${{ secrets.NUGET_APIKEY }} \
                       -s https://api.nuget.org/v3/index.json \
                       -t 3000 \
@@ -93,7 +129,7 @@ jobs:
       if: ${{ github.event.inputs.release_reference == 'true' }}
       run: |
         echo "Pushing Manifest packs for version ${{ github.event.inputs.net_sdk_version }}"...
-        dotnet nuget push ./workload/out/nuget-unsigned/Samsung.Tizen.Ref.*.nupkg \
+        dotnet nuget push ${{ steps.stage.outputs.staging }}/Samsung.Tizen.Ref.*.nupkg \
                       -k ${{ secrets.NUGET_APIKEY }} \
                       -s https://api.nuget.org/v3/index.json \
                       -t 3000 \

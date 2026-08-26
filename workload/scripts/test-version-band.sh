@@ -24,6 +24,7 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+WORKLOAD_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SH_SCRIPT="$SCRIPT_DIR/workload-install.sh"
 PS1_SCRIPT="$SCRIPT_DIR/workload-install.ps1"
 
@@ -87,45 +88,137 @@ for case in "${CASES[@]}"; do
     fi
 done
 
-# --- parity check: the PowerShell installer must agree ---------------------
+# --- parity check: load the REAL PowerShell implementation -----------------
 #
-# workload-install.ps1 reimplements the same logic. Run the same cases through
-# pwsh when it is available so the two installers cannot drift apart.
+# The PS logic is extracted from workload-install.ps1 between the same
+# BEGIN/END VERSION BAND DETECTION markers and dot-sourced, rather than
+# reimplemented here. A hand-copied reimplementation would agree with itself
+# forever and could never detect the two installers drifting apart.
 
 if command -v pwsh >/dev/null 2>&1 && [[ -f "$PS1_SCRIPT" ]]; then
     echo ""
-    echo "-- PowerShell parity --"
+    echo "-- PowerShell parity (real Get-TargetVersionBand) --"
+
+    ps_results="$(pwsh -NoProfile -Command "
+        \$src = Get-Content -Raw '$PS1_SCRIPT'
+        \$block = [regex]::Match(\$src, '(?s)# BEGIN VERSION BAND DETECTION.*?# END VERSION BAND DETECTION').Value
+        if (-not \$block) { Write-Output 'EXTRACT_FAILED'; exit 1 }
+        Invoke-Expression \$block
+        foreach (\$v in @($(printf "'%s'," "${CASES[@]%%|*}" | sed 's/,$//'))) {
+            Write-Output (\$v + '=' + (Get-TargetVersionBand -DotnetVersion \$v))
+        }" 2>/dev/null | tr -d '\r')"
+
+    if [[ "$ps_results" == *EXTRACT_FAILED* || -z "$ps_results" ]]; then
+        printf "  %sFAIL%s  could not extract Get-TargetVersionBand from workload-install.ps1\n" "$c_red" "$c_reset"
+        fail=$((fail + 1))
+    else
+        for case in "${CASES[@]}"; do
+            version="${case%%|*}"
+            expected="${case##*|}"
+            actual="$(grep -F "$version=" <<< "$ps_results" | head -1 | cut -d'=' -f2-)"
+            if [[ "$actual" == "$expected" ]]; then
+                printf "  %sPASS%s  %-32s -> %s\n" "$c_green" "$c_reset" "$version" "$actual"
+                pass=$((pass + 1))
+            else
+                printf "  %sFAIL%s  %-32s -> %s (expected %s)\n" "$c_red" "$c_reset" "$version" "${actual:-<none>}" "$expected"
+                fail=$((fail + 1))
+            fi
+        done
+    fi
+else
+    echo ""
+    echo "  (pwsh not available - skipping workload-install.ps1 parity check)"
+fi
+
+# --- fallback family: an 11.x request must never resolve to a 10.x manifest ----
+#
+# The PowerShell fallback used a fixed-length prefix, so '...Manifest-11.0.100-preview.7'
+# was truncated to '...Manifest-1' and matched the 10.x entries, installing a .NET 10
+# manifest into an 11.x band. Both installers must now stay inside one major.minor family.
+
+echo ""
+echo "-- fallback band family --"
+
+FALLBACK_CASES=(
+    "samsung.net.sdk.tizen.manifest-11.0.100-preview.7|samsung.net.sdk.tizen.manifest-11.0."
+    "samsung.net.sdk.tizen.manifest-10.0.300|samsung.net.sdk.tizen.manifest-10.0."
+    "samsung.net.sdk.tizen.manifest-9.0.100-rc.1|samsung.net.sdk.tizen.manifest-9.0."
+    "samsung.net.sdk.tizen.manifest-6.0.400|samsung.net.sdk.tizen.manifest-6.0."
+)
+
+for case in "${FALLBACK_CASES[@]}"; do
+    mid="${case%%|*}"
+    want="${case##*|}"
+    family="${mid#*-}"
+    family="$(echo "$family" | sed -E 's/^([0-9]+\.[0-9]+)\..*/\1/')"
+    got="${mid%%-*}-${family}."
+    if [[ "$got" == "$want" ]]; then
+        printf "  %sPASS%s  %-48s -> %s\n" "$c_green" "$c_reset" "$mid" "$got"
+        pass=$((pass + 1))
+    else
+        printf "  %sFAIL%s  %-48s -> %s (expected %s)\n" "$c_red" "$c_reset" "$mid" "$got" "$want"
+        fail=$((fail + 1))
+    fi
+done
+
+# The 11.x family prefix must not match any 10.x map key.
+if grep -q 'MANIFEST_BASE_NAME-10\.' "$SH_SCRIPT" && \
+   ! grep -q '"\$MANIFEST_BASE_NAME-11\.0\.' "$SH_SCRIPT"; then
+    printf "  %sPASS%s  %-48s\n" "$c_green" "$c_reset" "11.0 family has no map entry (fallback must fail closed)"
+    pass=$((pass + 1))
+fi
+
+# --- producer/consumer parity: Config.mk must agree with the installers -------
+#
+# Config.mk decides where `make install` puts the manifest; the installers decide where
+# the SDK looks for it. If they disagree the workload installs into a directory nothing
+# reads. Config.mk previously did NOT round the feature band for stable non-6 versions,
+# so 10.0.404 produced band '10.0.404' while the installers looked for '10.0.400'.
+
+echo ""
+echo "-- Config.mk producer parity --"
+
+if command -v make >/dev/null 2>&1; then
     for case in "${CASES[@]}"; do
         version="${case%%|*}"
         expected="${case##*|}"
-        actual="$(pwsh -NoProfile -Command "
-            \$DotnetVersion = '$version'
-            \$VersionSplitSymbol = '.'
-            \$SplitVersion = \$DotnetVersion.Split(\$VersionSplitSymbol)
-            \$CurrentDotnetVersion = [Version]\"\$(\$SplitVersion[0]).\$(\$SplitVersion[1])\"
-            \$DotnetVersionBand = \$SplitVersion[0] + \$VersionSplitSymbol + \$SplitVersion[1] + \$VersionSplitSymbol + \$SplitVersion[2][0] + '00'
-            \$DotnetTargetVersionBand = \$DotnetVersionBand
-            if (\$CurrentDotnetVersion -ge [Version]'7.0') {
-                \$IsPreviewVersion = \$DotnetVersion.Contains('-preview') -or \$DotnetVersion.Contains('-rc') -or \$DotnetVersion.Contains('-alpha')
-                if (\$IsPreviewVersion -and (\$SplitVersion.Count -ge 4)) {
-                    \$DotnetTargetVersionBand = \$DotnetVersionBand + \$SplitVersion[2].SubString(3) + \$VersionSplitSymbol + \$(\$SplitVersion[3])
-                }
-                elseif (\$DotnetVersion.Contains('-rtm') -and (\$SplitVersion.Count -ge 3)) {
-                    \$DotnetTargetVersionBand = \$DotnetVersionBand + \$SplitVersion[2].SubString(3)
-                }
-            }
-            Write-Output \$DotnetTargetVersionBand" 2>/dev/null | tr -d '\r')"
+        # Config.mk only handles versions it can split; skip the ones make can't model.
+        actual="$(make -s -C "$WORKLOAD_DIR" print-version-band DOTNET_VERSION="$version" 2>/dev/null | tail -1)"
         if [[ "$actual" == "$expected" ]]; then
             printf "  %sPASS%s  %-32s -> %s\n" "$c_green" "$c_reset" "$version" "$actual"
             pass=$((pass + 1))
         else
-            printf "  %sFAIL%s  %-32s -> %s (expected %s)\n" "$c_red" "$c_reset" "$version" "$actual" "$expected"
+            printf "  %sFAIL%s  %-32s -> %s (installers say %s)\n" "$c_red" "$c_reset" "$version" "${actual:-<none>}" "$expected"
             fail=$((fail + 1))
         fi
     done
 else
-    echo ""
-    echo "  (pwsh not available - skipping workload-install.ps1 parity check)"
+    echo "  (make not available - skipping Config.mk parity check)"
+fi
+
+# --- band isolation: one tree must not reuse another band's SDK ---------------
+#
+# DOTNET_DESTDIR and the install stamp were previously unscoped, so
+# `make install DOTNET_VERSION=11...` in a tree that had already built .NET 10 reused the
+# old SDK and silently tested the wrong band.
+
+echo ""
+echo "-- band isolation --"
+
+if command -v make >/dev/null 2>&1; then
+    for var in print-dotnet-destdir print-install-stamp; do
+        a="$(DOTNET_VERSION=10.0.100 make -s -C "$WORKLOAD_DIR" $var 2>/dev/null | tail -1)"
+        b="$(DOTNET_VERSION=11.0.100-preview.7.26381.103 make -s -C "$WORKLOAD_DIR" $var 2>/dev/null | tail -1)"
+        if [[ -n "$a" && -n "$b" && "$a" != "$b" ]]; then
+            printf "  %sPASS%s  %-24s differs across bands\n" "$c_green" "$c_reset" "$var"
+            pass=$((pass + 1))
+        else
+            printf "  %sFAIL%s  %-24s same for both bands (%s)\n" "$c_red" "$c_reset" "$var" "$a"
+            fail=$((fail + 1))
+        fi
+    done
+else
+    echo "  (make not available - skipping band isolation check)"
 fi
 
 echo ""

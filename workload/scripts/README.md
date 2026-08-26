@@ -62,13 +62,22 @@ download a 404. Add the entry *after* the release, not before — see commit
 ## test-version-band
 
 `Generate-InstallScripts.ps1 -Check` only compares the generated version-map block, so it cannot
-see problems elsewhere in the installers. Two extra guards cover that gap:
+see problems elsewhere in the installers. Several extra guards cover that gap:
 
 * [`test-version-band.sh`](./test-version-band.sh) asserts the SDK-version → feature-band mapping
-  (for example `11.0.100-preview.7.26381.103` → `11.0.100-preview.7`) and checks that
-  `workload-install.sh` and `workload-install.ps1` agree. The bash implementation is extracted
-  live from `workload-install.sh` between the `BEGIN/END VERSION BAND DETECTION` markers, so the
-  test always exercises shipped code — keep those markers intact.
+  (for example `11.0.100-preview.7.26381.103` → `11.0.100-preview.7`). It extracts the bash
+  implementation from `workload-install.sh` and the PowerShell one from `workload-install.ps1`,
+  in both cases between the `BEGIN/END VERSION BAND DETECTION` markers, and additionally compares
+  both against `Config.mk`'s `DOTNET_VERSION_BAND`. Extracting the real code — rather than
+  reimplementing it in the test — is what lets the test detect the two installers drifting apart.
+  It also pins the manifest fallback band family and `DOTNET_DESTDIR` band isolation.
+  **Keep those markers intact.**
+* [`test-template-conditions.sh`](./test-template-conditions.sh) extracts the template's platform
+  detection `PropertyGroup` (between the `BEGIN/END TIZEN UI PLATFORM DETECTION` markers) and
+  pins it across 13 TFMs.
+* [`test-install-failure.sh`](./test-install-failure.sh) pins installer exit codes: a failed
+  install must exit non-zero rather than printing `DONE` and exiting 0.
+* `test-matrix.sh --self-test` pins matrix row selection without needing a dotnet install.
 * `Generate-InstallScripts.ps1` additionally verifies both installers contain no NUL bytes and
   end with their expected final statement. Both scripts had previously been committed truncated
   mid-statement and NUL-padded, which the version-map drift check reported as "OK".
@@ -78,6 +87,9 @@ Run everything at once with:
 ```
 make -C workload check
 ```
+
+`pwsh` is required for the drift/integrity checks. Without it `make check` fails with an
+actionable message; use `make check SKIP_PWSH_CHECKS=1` to proceed with those unverified.
 
 ### Why
 

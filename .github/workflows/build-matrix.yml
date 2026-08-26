@@ -39,8 +39,21 @@ jobs:
   validate-metadata:
     name: Validate workload metadata
     runs-on: ubuntu-22.04
+    outputs:
+      net11_sdk: ${{ steps.versions.outputs.net11_sdk }}
     steps:
     - uses: actions/checkout@v3
+
+    - name: Resolve .NET 11 SDK version from Versions.props
+      id: versions
+      run: |
+        NET11=$(grep -oP '(?<=<DotNet11SdkVersion>)[^<]+' workload/build/Versions.props)
+        if [ -z "$NET11" ]; then
+          echo "::error::DotNet11SdkVersion not found in workload/build/Versions.props"
+          exit 1
+        fi
+        echo "net11_sdk=$NET11" >> "$GITHUB_OUTPUT"
+        echo "::notice ::.NET 11 SDK for CI: $NET11"
 
     - name: Authenticate GitHub Packages NuGet source
       run: |
@@ -53,27 +66,34 @@ jobs:
     - name: Run validate-workload-metadata.py
       run: python3 workload/scripts/validate-workload-metadata.py
 
+    - name: Run test-matrix.sh --self-test
+      run: bash workload/scripts/test-matrix.sh --self-test
+
     - name: Run test-version-band.sh
       run: bash workload/scripts/test-version-band.sh
+
+    - name: Run test-template-conditions.sh
+      run: bash workload/scripts/test-template-conditions.sh
+
+    - name: Run test-install-failure.sh
+      run: bash workload/scripts/test-install-failure.sh
 
   test-matrix:
     name: Multi-TFM build matrix (${{ matrix.name }})
     needs: validate-metadata
     runs-on: ubuntu-22.04
-    continue-on-error: ${{ matrix.experimental }}
+    # The .NET 11 leg is advisory only while the branch targets a shipping band. On a
+    # net11.0 branch (or a PR into one) .NET 11 is the product, so it must block.
+    continue-on-error: ${{ matrix.experimental && !(github.ref_name == 'net11.0' || github.base_ref == 'net11.0') }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Shipping band. Blocking.
           - name: .NET 10
             dotnet_version: ''
             experimental: false
-          # .NET 11 is still a preview SDK band, so a failure here must not block
-          # merges to the .NET 10 branch. It builds the workload against the .NET 11
-          # SDK and runs the net11.0-* matrix rows end to end.
           - name: .NET 11 preview
-            dotnet_version: '11.0.100-preview.7.26381.103'
+            dotnet_version: ${{ needs.validate-metadata.outputs.net11_sdk }}
             experimental: true
     steps:
     - uses: actions/checkout@v3

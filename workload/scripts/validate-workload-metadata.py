@@ -31,6 +31,11 @@ Checks:
       cannot resolve Samsung.NETCore.App.Runtime.tizen and the build fails with
       NETSDK1082 ("no runtime pack available").
   C6  Every KnownRuntimePack .NET major has a FileList row in RuntimeList.xml.
+  C7  DotNet11SdkVersion exists in Versions.props and no workflow hardcodes a
+      different .NET 11 SDK version (the workflows must grep the SSOT).
+  C8  PackageTargetFallback covers every (.NET major from KnownRuntimePack) x
+      (platform from TizenSdkSupportedTargetPlatformVersion) combination. A missing
+      entry silently downgrades a package to its netstandard2.x assets.
 
 Run from anywhere — paths derive from this script's location.
 
@@ -215,6 +220,47 @@ def main() -> int:
     else:
         ok("C6: KnownRuntimePack majors (" + str(len(krp_tfms)) +
            ") all present in RuntimeList.xml")
+
+    # --- C7 ---
+    net11_sdk = props.get("DotNet11SdkVersion", "")
+    if not net11_sdk:
+        err("C7: <DotNet11SdkVersion> missing from Versions.props; CI resolves the .NET 11 "
+            "SDK by grepping it")
+    else:
+        workflow_dir = WORKLOAD_DIR.parent / ".github" / "workflows"
+        stray = []
+        for wf in sorted(workflow_dir.glob("*.yml")):
+            text = wf.read_text(encoding="utf-8")
+            for literal in set(re.findall(r"\b11\.0\.\d{3}-[A-Za-z0-9.]+", text)):
+                if literal != net11_sdk:
+                    stray.append(wf.name + ": " + literal)
+        if stray:
+            err("C7: workflow(s) hardcode a .NET 11 SDK version differing from "
+                "DotNet11SdkVersion (" + net11_sdk + "): " + str(sorted(stray)))
+        else:
+            ok("C7: DotNet11SdkVersion = " + net11_sdk + "; no conflicting workflow literals")
+
+    # --- C8 ---
+    nuget_targets = read("src/Samsung.Tizen.Sdk/targets/Samsung.Tizen.Sdk.NuGet.targets")
+    ptf_match = re.search(r"<PackageTargetFallback>(.*?)</PackageTargetFallback>",
+                          nuget_targets, re.S)
+    if not ptf_match:
+        err("C8: PackageTargetFallback not found in Samsung.Tizen.Sdk.NuGet.targets")
+    elif not krp_tfms or not supported_set:
+        err("C8: cannot evaluate - KnownRuntimePack or supported platform list empty")
+    else:
+        listed = set(
+            e.strip() for e in ptf_match.group(1).replace("\n", "").split(";") if e.strip()
+        )
+        expected = {m + "-tizen" + p for m in krp_tfms for p in supported_set}
+        missing_ptf = sorted(expected - listed)
+        if missing_ptf:
+            err("C8: PackageTargetFallback missing " + str(missing_ptf) +
+                ". A package shipping lib/<tfm>/ alongside netstandard2.x would silently "
+                "resolve to the netstandard assets for those TFMs.")
+        else:
+            ok("C8: PackageTargetFallback covers all " + str(len(expected)) +
+               " supported (.NET major x platform) combinations")
 
     print()
     if errors:

@@ -24,6 +24,14 @@ WORKLOAD_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 DOTNET="${DOTNET:-dotnet}"
 TMPDIR="${TEST_MATRIX_TMP:-$WORKLOAD_DIR/.tmp/matrix}"
 ONLY="${TEST_MATRIX_ONLY:-}"
+SELF_TEST=""
+
+for arg in "$@"; do
+    case "$arg" in
+        --self-test) SELF_TEST="1" ;;
+        *) echo "Unknown argument '$arg'"; exit 2 ;;
+    esac
+done
 
 # Matrix rows: "<TargetFramework>|<api-version>"
 #
@@ -63,24 +71,60 @@ fail()   { printf "  %sFAIL%s  %s\n" "$c_red"   "$c_reset" "$*"; }
 warn()   { printf "  %sWARN%s  %s\n" "$c_yellow" "$c_reset" "$*"; }
 skip()   { printf "  %sSKIP%s  %s\n" "$c_yellow" "$c_reset" "$*"; }
 
-# Major versions of the .NET SDKs visible to $DOTNET, e.g. "8 9 10".
+# Newest .NET SDK major visible to $DOTNET, e.g. "11".
 # Populated once, after the $DOTNET prerequisite check below.
-INSTALLED_SDK_MAJORS=""
+LATEST_SDK_MAJOR=""
 
-# sdk_supports <netver>   e.g. sdk_supports net11.0
-# An SDK can only build a TFM whose .NET major it ships, so a net11.0 row needs
-# an 11.x SDK. Returns non-zero when unavailable so the row can be skipped.
-sdk_supports() {
+# sdk_can_target <netver>   e.g. sdk_can_target net11.0
+# An SDK can build any TFM up to and including its own major (the .NET 10 SDK builds
+# net8.0/net9.0/net10.0 fine), so a row is only unbuildable when its .NET major is
+# NEWER than the newest installed SDK. Returns non-zero in that case so the row is
+# skipped rather than reported as a failure.
+sdk_can_target() {
     local netver="$1"
     local want="${netver#net}"; want="${want%%.*}"
-    local have
-    for have in $INSTALLED_SDK_MAJORS; do
-        [[ "$have" == "$want" ]] && return 0
-    done
-    return 1
+    [[ -n "$LATEST_SDK_MAJOR" ]] || return 0
+    [[ "$want" -le "$LATEST_SDK_MAJOR" ]]
 }
 
 # --- prerequisites ---------------------------------------------------------
+
+# --self-test exercises the row-selection logic without any dotnet install, so CI can
+# pin it in the cheap metadata job. A regression here is expensive but silent: an
+# over-strict check makes every row "skip", and the matrix reports success having
+# built nothing.
+if [[ -n "$SELF_TEST" ]]; then
+    st_pass=0; st_fail=0
+    # "<newest installed SDK major>|<row TFM>|<expected: run|skip>"
+    #
+    # An SDK builds its own major and every earlier one, so only rows NEWER than the
+    # installed SDK may be skipped.
+    for c in \
+        "10|net8.0-tizen10.0|run"  "10|net9.0-tizen10.0|run"  "10|net10.0-tizen11.0|run" \
+        "10|net11.0-tizen11.0|skip" "10|net12.0-tizen11.0|skip" \
+        "11|net8.0-tizen10.0|run"  "11|net9.0-tizen10.0|run"  "11|net11.0-tizen11.0|run" \
+        "11|net12.0-tizen11.0|skip" \
+        "9|net8.0-tizen10.0|run"   "9|net10.0-tizen10.0|skip"
+    do
+        IFS='|' read -r major tfm want <<< "$c"
+        LATEST_SDK_MAJOR="$major"
+        netver="${tfm%-tizen*}"
+        if sdk_can_target "$netver"; then got="run"; else got="skip"; fi
+        if [[ "$got" == "$want" ]]; then
+            printf "  %sPASS%s  sdk=%-3s %-22s -> %s\n" "$c_green" "$c_reset" "$major.x" "$tfm" "$got"
+            st_pass=$((st_pass + 1))
+        else
+            printf "  %sFAIL%s  sdk=%-3s %-22s -> %s (expected %s)\n" "$c_red" "$c_reset" "$major.x" "$tfm" "$got" "$want"
+            st_fail=$((st_fail + 1))
+        fi
+    done
+    echo ""
+    echo "============ test-matrix self-test summary ============"
+    echo "  passed: $st_pass"
+    echo "  failed: $st_fail"
+    [[ $st_fail -eq 0 ]] || exit 1
+    exit 0
+fi
 
 if ! command -v "$DOTNET" >/dev/null 2>&1; then
     log "ERROR: '$DOTNET' command not found."
@@ -97,9 +141,9 @@ fi
 
 mkdir -p "$TMPDIR"
 
-# Discover which .NET majors this dotnet can build for.
-INSTALLED_SDK_MAJORS="$("$DOTNET" --list-sdks 2>/dev/null | sed -E 's/^([0-9]+)\..*/\1/' | sort -un | tr '\n' ' ')"
-log "Installed .NET SDK majors: ${INSTALLED_SDK_MAJORS:-<none detected>}"
+# Discover the newest .NET major this dotnet can build for.
+LATEST_SDK_MAJOR="$("$DOTNET" --list-sdks 2>/dev/null | sed -E 's/^([0-9]+)\..*/\1/' | sort -un | tail -1)"
+log "Newest .NET SDK major: ${LATEST_SDK_MAJOR:-<none detected>}"
 
 # --- matrix loop -----------------------------------------------------------
 
@@ -122,8 +166,8 @@ for entry in "${MATRIX[@]}"; do
     log ""
     log "==> [$tfm] api-version=$apiver"
 
-    if ! sdk_supports "$netver"; then
-        skip "$tfm  (no ${netver} SDK installed; rerun with DOTNET_VERSION=<${netver#net} sdk>)"
+    if ! sdk_can_target "$netver"; then
+        skip "$tfm  (needs a ${netver#net}+ SDK; newest installed is ${LATEST_SDK_MAJOR}.x)"
         skip_count+=1
         skipped_rows+=("$tfm")
         continue

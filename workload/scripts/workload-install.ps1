@@ -114,21 +114,29 @@ function Get-LatestVersion([string]$Id) {
     }
     else
     {
-        $SubStringId = $Id.Substring(0, $ManifestBaseName.Length + 2);
-        $MatchingFallbackId = @()
-        $MatchingFallbackVersion = @()
-        foreach ($key in $LatestVersionMap.Keys) {
-            if ($key -like "$SubStringId*") {
-                $MatchingFallbackId += $key
-                $MatchingFallbackVersion += $LatestVersionMap[$key]
-            }
-        }
-        if ($MatchingFallbackVersion)
+        # Only fall back within the SAME .NET major.minor family.
+        #
+        # This used to take a fixed-length prefix ($ManifestBaseName.Length + 2), which for
+        # '...Manifest-11.0.100-preview.7' yields '...Manifest-1' and therefore matches the
+        # 10.x entries too - silently installing a .NET 10 manifest into an 11.x band.
+        $BandPrefix = Get-BandFamilyPrefix -ManifestId $Id
+        if ($BandPrefix)
         {
-            $global:FallbackId = $MatchingFallbackId[-1]
-            $FallbackVersion = $MatchingFallbackVersion[-1]
-            Write-Host "Return fallback version: $FallbackVersion"
-            return $FallbackVersion
+            $MatchingFallbackId = @()
+            $MatchingFallbackVersion = @()
+            foreach ($key in $LatestVersionMap.Keys) {
+                if ($key -like "$BandPrefix*") {
+                    $MatchingFallbackId += $key
+                    $MatchingFallbackVersion += $LatestVersionMap[$key]
+                }
+            }
+            if ($MatchingFallbackVersion)
+            {
+                $global:FallbackId = $MatchingFallbackId[-1]
+                $FallbackVersion = $MatchingFallbackVersion[-1]
+                Write-Host "Return fallback version: $FallbackVersion (from $($MatchingFallbackId[-1]))"
+                return $FallbackVersion
+            }
         }
     }
 
@@ -192,6 +200,40 @@ function Remove-Pack([string]$Id, [string]$Version, [string]$Kind) {
     }
 }
 
+# BEGIN VERSION BAND DETECTION -- covered by scripts/test-version-band.sh
+# Map a full .NET SDK version to the SDK feature band used for the workload manifest
+# directory / NuGet package suffix. Must stay behaviourally identical to
+# compute_target_version_band() in workload-install.sh.
+function Get-TargetVersionBand([string]$DotnetVersion)
+{
+    $VersionSplitSymbol = '.'
+    $SplitVersion = $DotnetVersion.Split($VersionSplitSymbol)
+    $CurrentDotnetVersion = [Version]"$($SplitVersion[0]).$($SplitVersion[1])"
+    # Feature bands round the patch component down to the nearest hundred: 10.0.404 -> 10.0.400.
+    $DotnetVersionBand = $SplitVersion[0] + $VersionSplitSymbol + $SplitVersion[1] + $VersionSplitSymbol + $SplitVersion[2][0] + "00"
+
+    if ($CurrentDotnetVersion -ge [Version]"7.0")
+    {
+        $IsPreviewVersion = $DotnetVersion.Contains("-preview") -or $DotnetVersion.Contains("-rc") -or $DotnetVersion.Contains("-alpha")
+        if ($IsPreviewVersion -and ($SplitVersion.Count -ge 4)) {
+            return $DotnetVersionBand + $SplitVersion[2].SubString(3) + $VersionSplitSymbol + $($SplitVersion[3])
+        }
+        elseif ($DotnetVersion.Contains("-rtm") -and ($SplitVersion.Count -ge 3)) {
+            return $DotnetVersionBand + $SplitVersion[2].SubString(3)
+        }
+    }
+    return $DotnetVersionBand
+}
+
+# '<base>-11.0.100-preview.7' -> '<base>-11.0.' so fallback stays inside one .NET major.minor.
+function Get-BandFamilyPrefix([string]$ManifestId)
+{
+    $Match = [regex]::Match($ManifestId, '-(\d+\.\d+)\.')
+    if (-not $Match.Success) { return "" }
+    return $ManifestId.Substring(0, $ManifestId.IndexOf("-") + 1) + $Match.Groups[1].Value + "."
+}
+# END VERSION BAND DETECTION
+
 function Install-TizenWorkload([string]$DotnetVersion)
 {
     $VersionSplitSymbol = '.'
@@ -202,24 +244,8 @@ function Install-TizenWorkload([string]$DotnetVersion)
     $ManifestName = "$ManifestBaseName-$DotnetVersionBand"
 
     if ($DotnetTargetVersionBand -eq "<auto>" -or $UpdateAllWorkloads.IsPresent) {
-        if ($CurrentDotnetVersion -ge "7.0")
-        {
-            $IsPreviewVersion = $DotnetVersion.Contains("-preview") -or $DotnetVersion.Contains("-rc") -or $DotnetVersion.Contains("-alpha")
-            if ($IsPreviewVersion -and ($SplitVersion.Count -ge 4)) {
-                $DotnetTargetVersionBand = $DotnetVersionBand + $SplitVersion[2].SubString(3) + $VersionSplitSymbol + $($SplitVersion[3])
-                $ManifestName = "$ManifestBaseName-$DotnetTargetVersionBand"
-            }
-            elseif ($DotnetVersion.Contains("-rtm") -and ($SplitVersion.Count -ge 3)) {
-                $DotnetTargetVersionBand = $DotnetVersionBand + $SplitVersion[2].SubString(3)
-                $ManifestName = "$ManifestBaseName-$DotnetTargetVersionBand"
-            }
-            else {
-                $DotnetTargetVersionBand = $DotnetVersionBand
-            }
-        }
-        else {
-            $DotnetTargetVersionBand = $DotnetVersionBand
-        }
+        $DotnetTargetVersionBand = Get-TargetVersionBand -DotnetVersion $DotnetVersion
+        $ManifestName = "$ManifestBaseName-$DotnetTargetVersionBand"
     }
 
     # Check latest version of manifest.
@@ -295,7 +321,8 @@ if ($DotnetInstallDir -eq "<auto>") {
     }
 }
 if (-Not $(Test-Path "$DotnetInstallDir")) {
-    Write-Error "No installed dotnet '$DotnetInstallDir'."
+    Write-Host "No installed dotnet '$DotnetInstallDir'."
+    exit 1
 }
 
 # Check installed dotnet version
@@ -313,27 +340,38 @@ if (Get-Command $DotnetCommand -ErrorAction SilentlyContinue)
 }
 else
 {
-    Write-Error "'$DotnetCommand' occurs an error."
+    Write-Host "'$DotnetCommand' occurs an error."
+    exit 1
 }
 
 if (-Not $InstalledDotnetSdks)
 {
     Write-Host "`n.NET SDK version 6 or later is required to install Tizen Workload."
+    exit 1
 }
-else
+
+# Track per-SDK failures. -UpdateAllWorkloads keeps going across the remaining SDKs,
+# but the overall run must still report failure to the caller.
+$FailedSdks = @()
+
+foreach ($DotnetSdk in $InstalledDotnetSdks)
 {
-    foreach ($DotnetSdk in $InstalledDotnetSdks)
-    {
-        try {
-            Write-Host "`nCheck Tizen Workload for sdk $DotnetSdk"
-            Install-TizenWorkload -DotnetVersion $DotnetSdk
-        }
-        catch {
-            Write-Host "Failed to install Tizen Workload for sdk $DotnetSdk"
-            Write-Host "$_"
-            Continue
-        }
+    try {
+        Write-Host "`nCheck Tizen Workload for sdk $DotnetSdk"
+        Install-TizenWorkload -DotnetVersion $DotnetSdk
     }
+    catch {
+        Write-Host "Failed to install Tizen Workload for sdk $DotnetSdk"
+        Write-Host "$_"
+        $FailedSdks += $DotnetSdk
+        Continue
+    }
+}
+
+if ($FailedSdks.Count -gt 0)
+{
+    Write-Host "`nFAILED to install Tizen workload for sdk(s): $($FailedSdks -join ', ')"
+    exit 1
 }
 
 Write-Host "`nDone"

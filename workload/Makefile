@@ -59,7 +59,9 @@ $(eval $(call CreateNuGetPkgs,Samsung.NETCore.App.Runtime,$(TIZEN_WORKLOAD_VERSI
 packs: $(NUPKG_TARGETS)
 
 # Install workload to the dotnet sdk
-$(TMPDIR)/.stamp-install-workload: | $(DOTNET_MANIFESTS_DESTDIR)
+INSTALL_STAMP = $(TMPDIR)/.stamp-install-workload-$(DOTNET_VERSION_BAND)
+
+$(INSTALL_STAMP): | $(DOTNET_MANIFESTS_DESTDIR)
 	@cp -f \
 		$(TOP)/LICENSE \
 		$(TOP)/src/Samsung.NET.Sdk.Tizen/WorkloadManifest.targets \
@@ -70,14 +72,14 @@ $(TMPDIR)/.stamp-install-workload: | $(DOTNET_MANIFESTS_DESTDIR)
 	@touch $@
 
 .PHONY: install
-install: packs $(TMPDIR)/.stamp-install-workload
+install: packs $(INSTALL_STAMP)
 
 
 # Uninstall workload from the dotnet sdk
 .PHONY: uninstall
 uninstall:
 	@$(DOTNET) workload uninstall tizen
-	@rm -f $(TMPDIR)/.stamp-install-workload
+	@rm -f $(INSTALL_STAMP)
 
 # Create MSI windows installer
 define CreateMsi
@@ -99,9 +101,7 @@ $(TMPDIR)/msi: install
 	@cp -fr $(DOTNET_MANIFESTS_DESTDIR) $@/sdk-manifests/$(DOTNET_VERSION_BAND)
 	@mkdir -p $@/packs
 	@cp -fr $(DOTNET_DESTDIR)/packs/Samsung.Tizen.Sdk $@/packs
-	@cp -fr $(DOTNET_DESTDIR)/packs/Samsung.Tizen.Ref.API11 $@/packs
-	@cp -fr $(DOTNET_DESTDIR)/packs/Samsung.Tizen.Ref.API12 $@/packs
-	@cp -fr $(DOTNET_DESTDIR)/packs/Samsung.Tizen.Ref.API13 $@/packs
+	@cp -fr $(DOTNET_DESTDIR)/packs/Samsung.Tizen.Ref.API* $@/packs
 	@cp -fr $(DOTNET_DESTDIR)/packs/Samsung.NETCore.App.Runtime.* $@/packs
 	@mkdir -p $@/template-packs
 	@cp -f $(DOTNET_DESTDIR)/template-packs/samsung.tizen.templates.*.nupkg $@/template-packs
@@ -151,9 +151,42 @@ validate-metadata:
 test-version-band:
 	@bash $(TOP)/scripts/test-version-band.sh
 
+.PHONY: test-matrix-self-test
+test-matrix-self-test:
+	@bash $(TOP)/scripts/test-matrix.sh --self-test
+
+.PHONY: test-template-conditions
+test-template-conditions:
+	@bash $(TOP)/scripts/test-template-conditions.sh
+
+.PHONY: test-install-failure
+test-install-failure:
+	@bash $(TOP)/scripts/test-install-failure.sh
+
 .PHONY: check
-check: validate-metadata test-version-band
-	@pwsh $(TOP)/scripts/Generate-InstallScripts.ps1 -Check
+check: validate-metadata test-matrix-self-test test-version-band test-template-conditions test-install-failure
+	@if command -v pwsh >/dev/null 2>&1; then \
+		pwsh $(TOP)/scripts/Generate-InstallScripts.ps1 -Check; \
+	else \
+		echo "ERROR: pwsh not found. It is required to verify version-map drift and"; \
+		echo "       install-script integrity. Install PowerShell 7+ (https://aka.ms/powershell)"; \
+		echo "       or run: make check SKIP_PWSH_CHECKS=1 (leaves those checks unverified)."; \
+		[ -n "$(SKIP_PWSH_CHECKS)" ]; \
+	fi
+
+# Print the feature band Config.mk derives for DOTNET_VERSION. Used by
+# scripts/test-version-band.sh to prove the producer agrees with the installers.
+.PHONY: print-version-band
+print-version-band:
+	@echo $(DOTNET_VERSION_BAND)
+
+.PHONY: print-dotnet-destdir
+print-dotnet-destdir:
+	@echo $(DOTNET_DESTDIR)
+
+.PHONY: print-install-stamp
+print-install-stamp:
+	@echo $(INSTALL_STAMP)
 
 
 # Remove artifacts and temporary files
