@@ -86,7 +86,7 @@ assert "ownership is claimed via an atomic reservation ref" \
     "$(grep -q 'refs/tizen-release/v' "$WF" && echo 1 || echo 0)"
 
 assert "a foreign reservation aborts the run" \
-    "$(grep -q 'already reserved by another release' "$WF" && echo 1 || echo 0)"
+    "$(grep -q 'already reserved by a release with different inputs' "$WF" && echo 1 || echo 0)"
 
 assert "releases are serialized by a concurrency group" \
     "$(grep -q 'group: tizen-workload-release' "$WF" && echo 1 || echo 0)"
@@ -118,7 +118,7 @@ assert "reference-only run is non-mutating" \
     "$(grep -q 'Reference-only run: leaving TizenWorkloadVersion' "$WF" && echo 1 || echo 0)"
 
 assert "a resumed run rebuilds from the reservation's commit" \
-    "$(grep -q 'no reservation ref exists' "$WF" && echo 1 || echo 0)"
+    "$(grep -q 'print-field sha' "$WF" && grep -q 'release_sha=\$RESUME_SHA' "$WF" && echo 1 || echo 0)"
 
 assert "build is not continue-on-error" \
     "$(awk -v s="$BUILD_LN" -v e="$STAGE_LN" 'NR>s && NR<e && /continue-on-error/ {found=1} END{exit !found}' "$WF" && echo 0 || echo 1)"
@@ -126,7 +126,7 @@ assert "build is not continue-on-error" \
 # --- correctness of what gets published -------------------------------------
 
 assert "tag targets the reserved release commit" \
-    "$(grep -q 'target "\${{ steps.bump.outputs.release_sha }}"' "$WF" && echo 1 || echo 0)"
+    "$(grep -q 'SHA="\${{ steps.bump.outputs.release_sha }}"' "$WF" && grep -q -- '--target "\$SHA"' "$WF" && echo 1 || echo 0)"
 
 assert "release notes use the staged manifest id" \
     "$(grep -q 'steps.stage.outputs.manifest_id' "$WF" && echo 1 || echo 0)"
@@ -141,7 +141,7 @@ assert "no push globs the raw workspace output directory" \
     "$(grep -q 'dotnet nuget push ./workload/out/' "$WF" && echo 0 || echo 1)"
 
 assert "existing release tag is a no-op (resumable)" \
-    "$(grep -q 'already exists; skipping creation' "$WF" && echo 1 || echo 0)"
+    "$(grep -q 'already exists at the reserved commit' "$WF" && echo 1 || echo 0)"
 
 # --- partial-publication resume ---------------------------------------------
 
@@ -150,13 +150,13 @@ COMPANION_PUSH_LN=$(line_of "    - name: Push SDK/Runtime/Templates packs")
 VERIFY_LN=$(line_of "    - name: Verify publication is complete")
 
 assert "publication state is inspected before advancing the version" \
-    "$(grep -q 'release-state.py --version "\$OLD"' "$WF" && echo 1 || echo 0)"
+    "$(grep -q 'release-state.py --version "\$V"' "$WF" && echo 1 || echo 0)"
 
 assert "a partially published version is resumed, never advanced" \
-    "$(grep -q 'is partially published' "$WF" && echo 1 || echo 0)"
+    "$(grep -q 'is unfinished (state=\$STATE' "$WF" && grep -q 'NEW=\$(python3 scripts/next-workload-version.py)' "$WF" && echo 1 || echo 0)"
 
 assert "a published-but-untagged version is resumed to finish the tag" \
-    "$(grep -q 'is published but untagged' "$WF" && echo 1 || echo 0)"
+    "$(grep -q 'STATE" = "published" ] && \[ "\$RELEASED" = "true" \]' "$WF" && echo 1 || echo 0)"
 
 assert "companion packs are pushed BEFORE the manifest" \
     "$([[ -n "$COMPANION_PUSH_LN" && -n "$MANIFEST_PUSH_LN" && "$COMPANION_PUSH_LN" -lt "$MANIFEST_PUSH_LN" ]] && echo 1 || echo 0)"
@@ -189,6 +189,12 @@ PYEOF
 PUSHED="$(grep -oE '\$pattern|for pattern in [^;]*' "$WF" | sed -n 's/^for pattern in //p' | tr ' ' '\n' | sed '/^$/d' | sort -u)"
 
 norm() { sed 's/^Samsung\.NETCore\.App\.Runtime$/Samsung.NETCore.App.Runtime.tizen/' ; }
+
+# The reservation payload records the authoritative package set for a release, so it is a
+# THIRD place the list lives. All three must agree.
+RESERVED_PKGS="$(grep -oE 'PACKAGES="[^"]*"' "$WF" | head -1 | sed 's/PACKAGES="//;s/"$//' \
+    | tr ',' '\n' | sed 's/\$MANIFEST_ID//' | sed '/^$/d' | sort -u)"
+
 missing_from_state=""
 while read -r pkg; do
     [[ -z "$pkg" ]] && continue
@@ -200,7 +206,163 @@ assert "every pushed pack is tracked by release-state.py" \
     "$([[ -z "$missing_from_state" ]] && echo 1 || echo 0)"
 [[ -n "$missing_from_state" ]] && echo "        untracked:$missing_from_state"
 
-# --- failure injection against the real state script -------------------------
+# The reverse direction matters just as much and was missing. A package listed in
+# release-state.py that the workflow never pushes can never become present, so
+# "Verify publication is complete" would retry until it gave up and the release would
+# never be tagged - an unpublishable version, on every single run.
+missing_from_push=""
+NORM_PUSHED="$(echo "$PUSHED" | norm | sort -u)"
+while read -r pkg; do
+    [[ -z "$pkg" ]] && continue
+    grep -Fqx "$pkg" <<< "$NORM_PUSHED" || missing_from_push="$missing_from_push $pkg"
+done <<< "$STATE_PKGS"
+
+assert "every pack release-state.py waits for is actually pushed" \
+    "$([[ -z "$missing_from_push" ]] && echo 1 || echo 0)"
+[[ -n "$missing_from_push" ]] && echo "        never pushed:$missing_from_push"
+
+missing_from_reservation=""
+while read -r pkg; do
+    [[ -z "$pkg" ]] && continue
+    grep -Fqx "$pkg" <<< "$RESERVED_PKGS" || missing_from_reservation="$missing_from_reservation $pkg"
+done <<< "$STATE_PKGS"
+
+assert "the reservation payload records the same package set" \
+    "$([[ -z "$missing_from_reservation" ]] && echo 1 || echo 0)"
+[[ -n "$missing_from_reservation" ]] && echo "        not reserved:$missing_from_reservation"
+
+# --- durable resume, reservation binding and tag provenance ------------------
+assert "resume is driven by enumerating reservation refs, not by \$OLD" \
+    "$(grep -q "for-each-ref --format='%(refname)' 'refs/tizen-release/v\*'" "$WF" && echo 1 || echo 0)"
+
+assert "a candidate reservation must match this run's inputs before being resumed" \
+    "$(grep -q 'release-reservation.py verify' "$WF" && grep -q -- '--expect-band' "$WF" && echo 1 || echo 0)"
+
+assert "the reservation binds sdk, band, branch, manifest id and package set" \
+    "$(for f in --expect-sdk --expect-band --expect-branch --expect-manifest-id --expect-packages; do
+           grep -q -- "$f" "$WF" || { echo 0; exit; }; done; echo 1)"
+
+assert "the reservation is created as a compare-and-swap that requires absence" \
+    "$(grep -q -- '--force-with-lease="refs/tizen-release/v\$NEW:"' "$WF" && echo 1 || echo 0)"
+
+assert "two unfinished reservations for the same inputs abort rather than guess" \
+    "$(grep -q 'More than one unfinished reservation' "$WF" && echo 1 || echo 0)"
+
+assert "an existing tag is only reused when it targets the reserved commit" \
+    "$(grep -q 'is tagged at \$TAG_SHA but this version was reserved' "$WF" && echo 1 || echo 0)"
+
+assert "a release whose tag cannot be resolved to a commit is rejected" \
+    "$(grep -q 'its tag could not be resolved to a commit' "$WF" && echo 1 || echo 0)"
+
+# --- functional: reservation payload binding ---------------------------------
+#
+# Grep assertions above prove the workflow WIRES the reservation up. These run the real
+# script and prove it actually rejects the mismatches it is supposed to.
+RES="$WORKLOAD_DIR/scripts/release-reservation.py"
+RESDIR="$(mktemp -d)"
+PKGS="Samsung.NET.Sdk.Tizen.Manifest-11.0.100-preview.7,Samsung.NETCore.App.Runtime.tizen,Samsung.Tizen.Sdk,Samsung.Tizen.Templates"
+GOOD_SHA="1111111111111111111111111111111111111111"
+python3 "$RES" encode --version 10.0.128 --sha "$GOOD_SHA" \
+    --sdk 11.0.100-preview.7.26381.103 --band 11.0.100-preview.7 \
+    --manifest-id Samsung.NET.Sdk.Tizen.Manifest-11.0.100-preview.7 \
+    --packages "$PKGS" --branch net10.0 > "$RESDIR/p.json"
+
+assert "a reservation payload round-trips against its own inputs" \
+    "$(python3 "$RES" verify --payload-file "$RESDIR/p.json" --expect-version 10.0.128 \
+        --expect-sdk 11.0.100-preview.7.26381.103 --expect-band 11.0.100-preview.7 \
+        --expect-branch net10.0 --expect-packages "$PKGS" >/dev/null 2>&1 && echo 1 || echo 0)"
+
+assert "the reserved release SHA is recoverable from the payload" \
+    "$([[ "$(python3 "$RES" verify --payload-file "$RESDIR/p.json" --print-field sha)" == "$GOOD_SHA" ]] && echo 1 || echo 0)"
+
+# Each of these is a redispatch that must NOT be allowed to adopt the reservation.
+for bad in "--expect-band 10.0.100" "--expect-sdk 10.0.100" "--expect-branch main" \
+           "--expect-version 10.0.129" "--expect-manifest-id Samsung.NET.Sdk.Tizen.Manifest-10.0.100"; do
+    flag="${bad%% *}"
+    python3 "$RES" verify --payload-file "$RESDIR/p.json" $bad >/dev/null 2>&1
+    assert "a reservation is not adopted when $flag differs" \
+        "$([[ $? -eq 3 ]] && echo 1 || echo 0)"
+done
+
+python3 "$RES" verify --payload-file "$RESDIR/p.json" \
+    --expect-packages "Samsung.Tizen.Sdk,Samsung.Tizen.Templates" >/dev/null 2>&1
+assert "a reservation with a different package set is rejected" \
+    "$([[ $? -eq 3 ]] && echo 1 || echo 0)"
+
+# A bare pre-payload reservation carries no inputs, so it cannot be validated - and
+# therefore must not be resumed rather than being trusted by default.
+echo '{"version":"10.0.128","sha":"'"$GOOD_SHA"'"}' > "$RESDIR/legacy.json"
+python3 "$RES" verify --payload-file "$RESDIR/legacy.json" --expect-version 10.0.128 >/dev/null 2>&1
+assert "a reservation missing its input fields is refused, not trusted" \
+    "$([[ $? -eq 3 ]] && echo 1 || echo 0)"
+
+python3 "$RES" encode --version 10.0.128 --sha "deadbeef" --sdk x --band y \
+    --manifest-id z --packages a --branch b >/dev/null 2>&1
+assert "an abbreviated SHA is refused when reserving" \
+    "$([[ $? -eq 2 ]] && echo 1 || echo 0)"
+rm -rf "$RESDIR"
+
+# --- functional: OLD == NEW must be a no-op, not a failure -------------------
+#
+# The workflow calls `--apply --set-version` OUTSIDE a condition under `set -e`, so a
+# non-zero exit killed the step and made the documented "reserve the current commit"
+# recovery below it unreachable. This proves the exit code, which is what set -e sees.
+NWDIR="$(mktemp -d)"
+cat > "$NWDIR/Versions.props" <<'PROPS'
+<Project>
+  <PropertyGroup>
+    <TizenWorkloadVersion>10.0.128</TizenWorkloadVersion>
+  </PropertyGroup>
+</Project>
+PROPS
+python3 "$WORKLOAD_DIR/scripts/next-workload-version.py" --apply --set-version 10.0.128 \
+    --versions-props "$NWDIR/Versions.props" >/dev/null 2>&1
+assert "--set-version equal to the current value exits 0 (OLD == NEW is resumable)" \
+    "$([[ $? -eq 0 ]] && echo 1 || echo 0)"
+
+assert "the no-op leaves Versions.props byte-identical" \
+    "$(grep -q '<TizenWorkloadVersion>10.0.128</TizenWorkloadVersion>' "$NWDIR/Versions.props" && echo 1 || echo 0)"
+
+# Going BACKWARDS is still a hard error: only the equal case is a resume.
+python3 "$WORKLOAD_DIR/scripts/next-workload-version.py" --apply --set-version 10.0.127 \
+    --versions-props "$NWDIR/Versions.props" >/dev/null 2>&1
+assert "--set-version below the current value is still refused" \
+    "$([[ $? -ne 0 ]] && echo 1 || echo 0)"
+rm -rf "$NWDIR"
+
+# --- functional: a 200 that cannot be parsed is not "never published" --------
+FEED="$(mktemp -d)"
+mkdir -p "$FEED/samsung.tizen.sdk"
+# `{}` used to yield [] via .get("versions", []), making a published package look missing.
+echo '{}' > "$FEED/samsung.tizen.sdk/index.json"
+python3 "$WORKLOAD_DIR/scripts/release-state.py" --version 10.0.128 \
+    --band 11.0.100-preview.7 --feed-base "file://$FEED" >/dev/null 2>&1
+assert "an index with no 'versions' key is an error, not absence" \
+    "$([[ $? -eq 2 ]] && echo 1 || echo 0)"
+
+echo '{"versions": "10.0.128"}' > "$FEED/samsung.tizen.sdk/index.json"
+python3 "$WORKLOAD_DIR/scripts/release-state.py" --version 10.0.128 \
+    --band 11.0.100-preview.7 --feed-base "file://$FEED" >/dev/null 2>&1
+assert "an index whose 'versions' is not a list is an error" \
+    "$([[ $? -eq 2 ]] && echo 1 || echo 0)"
+rm -rf "$FEED"
+
+# --- functional: the search index is paginated and validated -----------------
+#
+# The search endpoint caps results per request, so a single query returned only the first
+# page. The stub feed puts the highest build counter on the LAST page: an unpaginated
+# reader answers 10.0.102 (a version already published) instead of 10.0.106.
+STUB="$WORKLOAD_DIR/scripts/stub-nuget-search.py"
+assert "the search index is paginated to completion" \
+    "$([[ "$(python3 "$STUB" ok)" == "rc=0 out=10.0.106" ]] && echo 1 || echo 0)"
+
+for mode in truncated nototal badtotal; do
+    assert "a $mode search response aborts instead of lowering the version" \
+        "$([[ "$(python3 "$STUB" "$mode")" == "rc=1 out=" ]] && echo 1 || echo 0)"
+done
+
+
+# --- failure injection against the real state script # --- failure injection against the real state script -------------------------
 #
 # Simulates a release interrupted at each step, using a local file:// feed, and asserts the
 # resume decision the workflow would make.

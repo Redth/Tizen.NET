@@ -143,6 +143,9 @@ fi
 # that version under the originally requested (non-existent) id 404s. For example
 # a request for '...manifest-10.0.400' resolves to '...manifest-10.0.300=10.0.127'
 # and the 10.0.300 package is what has to be downloaded.
+# BEGIN FALLBACK RESOLVER -- extracted by scripts/test-version-band.sh so the tests
+# exercise the SHIPPED resolver. A hand-copied reimplementation in the test cannot
+# detect drift from this function, which is the entire point of testing it.
 function getLatestVersion () {
     for index in "${LatestVersionMap[@]}"; do
          if [ "${index%%=*}" = "${1}" ]; then
@@ -194,6 +197,7 @@ function getLatestVersion () {
     fi
     echo "$fallbackId=$fallbackVersion"
 }
+# END FALLBACK RESOLVER
 
 # Check installed dotnet version
 DOTNET_COMMAND="$DOTNET_INSTALL_DIR/dotnet"
@@ -242,8 +246,27 @@ band_sort_key() {
     read -r -a parts <<< "$core"
     local major="${parts[0]:-0}" minor="${parts[1]:-0}" patch="${parts[2]:-0}"
     if [[ -n "$pre" ]]; then
-        printf '%05d%05d%05d0%s\n' "$major" "$minor" "$patch" "$pre"
+        # Normalise the pre-release so a plain string comparison follows SemVer precedence.
+        # Appending it raw made the comparison lexicographic, where "preview.10" sorts
+        # BELOW "preview.9" because '1' < '9' - so a request against a preview.10 band
+        # silently fell back to preview.9. Numeric identifiers are therefore zero-padded
+        # and tagged 0, alphanumeric ones tagged 1 (numeric < alphanumeric in SemVer).
+        # '.' sorts below digits and letters, so a shorter identifier list sorts first,
+        # which is also what SemVer requires.
+        local normalised=""
+        local ident
+        local oldIFS="$IFS"
+        IFS='.'
+        for ident in $pre; do
+            case "$ident" in
+                ''|*[!0-9]*) normalised="$normalised.$(printf '1%s' "$ident")" ;;
+                *)           normalised="$normalised.$(printf '0%010d' "$ident")" ;;
+            esac
+        done
+        IFS="$oldIFS"
+        printf '%05d%05d%05d0%s\n' "$major" "$minor" "$patch" "$normalised"
     else
+        # No pre-release: sorts above every pre-release of the same core version.
         printf '%05d%05d%05d1\n' "$major" "$minor" "$patch"
     fi
 }
@@ -271,10 +294,15 @@ function install_tizenworkload() {
     TARGET_BAND_IS_EXPLICIT="false"
     if [[ "$DOTNET_TARGET_VERSION_BAND" == "<auto>" ]]; then
         DOTNET_TARGET_VERSION_BAND=$(compute_target_version_band "$DOTNET_VERSION")
-        MANIFEST_NAME="$MANIFEST_BASE_NAME-$DOTNET_TARGET_VERSION_BAND"
     else
         TARGET_BAND_IS_EXPLICIT="true"
     fi
+    # The manifest package is named after the band it is FOR, so it must always follow the
+    # target band - including when that band was requested explicitly. Leaving it derived
+    # from the running SDK meant `-t 10.0.200` on a 10.0.100 SDK downloaded
+    # samsung.net.sdk.tizen.manifest-10.0.100 and installed it into sdk-manifests/10.0.200:
+    # the wrong band's manifest, in the right band's directory, reported as success.
+    MANIFEST_NAME="$MANIFEST_BASE_NAME-$DOTNET_TARGET_VERSION_BAND"
 
     # Check latest version of manifest.
     if [[ "$MANIFEST_VERSION" == "<latest>" ]]; then
@@ -320,20 +348,52 @@ function install_tizenworkload() {
     restore_global_json() {
         rm -f global.json
         if [[ "$CACHE_GLOBAL_JSON" == "true" ]]; then mv global.json.bak global.json; fi
+        CACHE_GLOBAL_JSON="false"
     }
+
+    # Everything from here to the end of the install is ONE transaction. A partial install
+    # is worse than no install: the SDK would be left with a manifest describing packs that
+    # are not present, or - when a download failed - with global.json still pinned and the
+    # user's real global.json sitting in global.json.bak, which the next loop iteration
+    # would then overwrite and destroy.
+    TX_TMPDIR=""
+    TX_MANIFEST_DEST=""
+    TX_MANIFEST_NEW=""
+    TX_MANIFEST_OLD=""
+    TX_SWAPPED="false"
+    TX_HAD_PREVIOUS="false"
+
+    # Release temporary state. Used on both paths; on the failure path TX_SWAPPED is still
+    # true, so the previous manifest is put back first.
+    tx_finish() {
+        if [[ "$TX_SWAPPED" == "true" ]]; then
+            # Put the previous manifest back exactly as it was.
+            rm -fr "$TX_MANIFEST_DEST"
+            if [[ "$TX_HAD_PREVIOUS" == "true" ]] && [ -d "$TX_MANIFEST_OLD" ]; then
+                mv "$TX_MANIFEST_OLD" "$TX_MANIFEST_DEST"
+            fi
+        fi
+        [ -n "$TX_MANIFEST_NEW" ] && rm -fr "$TX_MANIFEST_NEW"
+        [ -n "$TX_MANIFEST_OLD" ] && rm -fr "$TX_MANIFEST_OLD"
+        [ -n "$TX_TMPDIR" ] && rm -fr "$TX_TMPDIR"
+        restore_global_json
+    }
+
+    # Roll the SDK back to exactly the state it was in before this function ran.
+    tx_rollback() { tx_finish; }
 
     # This function is invoked under `if !`, which disables errexit for everything it calls,
     # so every command here is checked explicitly.
     if ! "$DOTNET_INSTALL_DIR/dotnet" new globaljson --sdk-version "$DOTNET_VERSION" --force >/dev/null; then
         echo "Failed to pin SDK $DOTNET_VERSION via global.json."
-        restore_global_json
+        tx_rollback
         return 1
     fi
 
     EFFECTIVE_VERSION="$("$DOTNET_INSTALL_DIR/dotnet" --version 2>/dev/null)"
     if [ "$EFFECTIVE_VERSION" != "$DOTNET_VERSION" ]; then
         echo "SDK pin did not take effect: requested $DOTNET_VERSION, active ${EFFECTIVE_VERSION:-<unknown>}."
-        restore_global_json
+        tx_rollback
         return 1
     fi
 
@@ -343,7 +403,7 @@ function install_tizenworkload() {
         EFFECTIVE_BAND="$(compute_target_version_band "$EFFECTIVE_VERSION")"
         if [ "$EFFECTIVE_BAND" != "$DOTNET_TARGET_VERSION_BAND" ]; then
             echo "Band mismatch: manifest targets $DOTNET_TARGET_VERSION_BAND but the active SDK resolves to $EFFECTIVE_BAND."
-            restore_global_json
+            tx_rollback
             return 1
         fi
     else
@@ -355,6 +415,7 @@ function install_tizenworkload() {
     ensure_directory "$SDK_MANIFESTS_DIR"
 
     TMPDIR=$(mktemp -d)
+    TX_TMPDIR="$TMPDIR"
 
     echo "Installing $MANIFEST_NAME/$MANIFEST_VERSION to $SDK_MANIFESTS_DIR..."
 
@@ -363,14 +424,18 @@ function install_tizenworkload() {
     CURL_STATUS=$?
     if [ $CURL_STATUS -ne 0 ]; then
         echo "Failed to download $MANIFEST_NAME/$MANIFEST_VERSION (curl exit $CURL_STATUS)."
-        rm -fr "$TMPDIR"
+        tx_rollback
         return 1
     fi
 
-    unzip -qq -d "$TMPDIR/unzipped" "$TMPDIR/manifest.zip"
+    if ! unzip -qq -d "$TMPDIR/unzipped" "$TMPDIR/manifest.zip"; then
+        echo "Failed to extract $MANIFEST_NAME/$MANIFEST_VERSION."
+        tx_rollback
+        return 1
+    fi
     if [ ! -d "$TMPDIR/unzipped/data" ]; then
         echo "No such files to install."
-        rm -fr "$TMPDIR"
+        tx_rollback
         return 1
     fi
     chmod 744 "$TMPDIR"/unzipped/data/*
@@ -380,8 +445,7 @@ function install_tizenworkload() {
     # this download had produced nothing usable.
     if [ ! -f "$TMPDIR/unzipped/data/WorkloadManifest.json" ]; then
         echo "Downloaded package does not contain WorkloadManifest.json."
-        rm -fr "$TMPDIR"
-        restore_global_json
+        tx_rollback
         return 1
     fi
 
@@ -392,17 +456,18 @@ function install_tizenworkload() {
     MANIFEST_NEW="$SDK_MANIFESTS_DIR/.samsung.net.sdk.tizen.new.$$"
     MANIFEST_OLD="$SDK_MANIFESTS_DIR/.samsung.net.sdk.tizen.old.$$"
     rm -fr "$MANIFEST_NEW" "$MANIFEST_OLD"
+    TX_MANIFEST_DEST="$MANIFEST_DEST"
+    TX_MANIFEST_NEW="$MANIFEST_NEW"
+    TX_MANIFEST_OLD="$MANIFEST_OLD"
 
     if ! mkdir -p "$MANIFEST_NEW" || ! cp -f "$TMPDIR"/unzipped/data/* "$MANIFEST_NEW/"; then
         echo "Failed to stage manifest files."
-        rm -fr "$MANIFEST_NEW" "$TMPDIR"
-        restore_global_json
+        tx_rollback
         return 1
     fi
     if [ ! -f "$MANIFEST_NEW/WorkloadManifest.json" ]; then
         echo "Staged manifest is incomplete."
-        rm -fr "$MANIFEST_NEW" "$TMPDIR"
-        restore_global_json
+        tx_rollback
         return 1
     fi
 
@@ -410,32 +475,36 @@ function install_tizenworkload() {
     if [ -d "$MANIFEST_DEST" ]; then
         if ! mv "$MANIFEST_DEST" "$MANIFEST_OLD"; then
             echo "Failed to set aside the existing manifest."
-            rm -fr "$MANIFEST_NEW" "$TMPDIR"
-            restore_global_json
+            tx_rollback
             return 1
         fi
         HAD_PREVIOUS="true"
+        TX_HAD_PREVIOUS="true"
     fi
 
     if ! mv "$MANIFEST_NEW" "$MANIFEST_DEST"; then
         echo "Failed to install the new manifest; rolling back."
-        if [[ "$HAD_PREVIOUS" == "true" ]]; then mv "$MANIFEST_OLD" "$MANIFEST_DEST"; fi
-        rm -fr "$MANIFEST_NEW" "$TMPDIR"
-        restore_global_json
+        tx_rollback
         return 1
     fi
-    rm -fr "$MANIFEST_OLD"
-    "$DOTNET_INSTALL_DIR/dotnet" workload install tizen --skip-manifest-update
-    local install_status=$?
+    TX_SWAPPED="true"
 
-    # Clean-up
-    rm -fr "$TMPDIR"
-    restore_global_json
+    # The pack install is part of the transaction. If it fails, the new manifest must not
+    # be left behind: it advertises packs that are not on disk, so every subsequent build
+    # against that band fails with a missing-pack error that looks unrelated to this run.
+    "$DOTNET_INSTALL_DIR/dotnet" workload install tizen --skip-manifest-update
+    install_status=$?
 
     if [ $install_status -ne 0 ]; then
         echo "Failed to install Tizen workload packs for $DOTNET_VERSION (exit $install_status)."
+        echo "Rolling back the manifest so the SDK is left as it was."
+        tx_rollback
         return $install_status
     fi
+
+    # Committed: keep the new manifest, drop the saved copy and the temporary state.
+    TX_SWAPPED="false"
+    tx_finish
 
     echo "Done installing Tizen workload $MANIFEST_VERSION"
     echo ""

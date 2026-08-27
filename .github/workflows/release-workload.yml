@@ -70,13 +70,20 @@ jobs:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         set -euo pipefail
-        OLD=$(grep -oP '(?<=<TizenWorkloadVersion>)[^<]+(?=</TizenWorkloadVersion>)' build/Versions.props)
-        echo "Current branch version: $OLD"
-
         SDK="${{ github.event.inputs.net_sdk_version }}"
         eval "$(sed -n '/# BEGIN VERSION BAND DETECTION/,/# END VERSION BAND DETECTION/p' scripts/workload-install.sh)"
         BAND="$(compute_target_version_band "$SDK")"
-        echo "band=$BAND" >> "$GITHUB_OUTPUT"
+        MANIFEST_ID="Samsung.NET.Sdk.Tizen.Manifest-$BAND"
+        PACKAGES="$MANIFEST_ID,Samsung.NETCore.App.Runtime.tizen,Samsung.Tizen.Sdk,Samsung.Tizen.Templates"
+        BRANCH="${GITHUB_REF_NAME}"
+        {
+          echo "band=$BAND"
+          echo "manifest_id=$MANIFEST_ID"
+          echo "packages=$PACKAGES"
+        } >> "$GITHUB_OUTPUT"
+
+        OLD=$(grep -oP '(?<=<TizenWorkloadVersion>)[^<]+(?=</TizenWorkloadVersion>)' build/Versions.props)
+        echo "Branch version at the checked-out commit: $OLD"
 
         # A reference-only run publishes no manifest: fully non-mutating, no reservation.
         if [ "${{ github.event.inputs.release_manifest }}" != "true" ]; then
@@ -86,70 +93,112 @@ jobs:
           exit 0
         fi
 
-        STATE_OUT="$(python3 scripts/release-state.py --version "$OLD" --band "$BAND")"
-        STATE="$(echo "$STATE_OUT" | sed -n 's/^state=//p')"
-        MISSING="$(echo "$STATE_OUT" | sed -n 's/^missing=//p')"
-        echo "State of $OLD: $STATE (missing: ${MISSING:-none})"
+        # ------------------------------------------------------------------
+        # Find an outstanding reservation to resume.
+        #
+        # Resuming used to be decided from $OLD - the version in Versions.props at the
+        # commit this job checked out. That is the wrong source of truth for a re-run:
+        # `Re-run jobs` checks out the SHA of the ORIGINAL event, which is the commit
+        # BEFORE the bump, so $OLD is the previous, already-released version. The re-run
+        # therefore saw "nothing to resume", computed the same candidate again, found its
+        # own reservation ref and aborted as though a stranger held it - leaving the
+        # interrupted release permanently unfinishable.
+        #
+        # The reservation refs are the durable record, so they are enumerated directly and
+        # matched against THIS run's inputs. The checked-out SHA no longer matters.
+        # ------------------------------------------------------------------
+        git fetch --force origin "+refs/tizen-release/*:refs/tizen-release/*" || true
 
-        if gh release view "v$OLD" >/dev/null 2>&1; then RELEASED=true; else RELEASED=false; fi
+        RESUME_VER=""
+        RESUME_SHA=""
+        for ref in $(git for-each-ref --format='%(refname)' 'refs/tizen-release/v*'); do
+          V="${ref##*/v}"
+          git cat-file -p "$ref" > "$RUNNER_TEMP/payload.txt" 2>/dev/null || continue
 
-        RESUME=false
-        if [ "$STATE" = "partial" ]; then
-          echo "::warning ::Version $OLD is partially published (missing: $MISSING). Resuming."
-          RESUME=true
-        elif [ "$STATE" = "published" ] && [ "$RELEASED" != "true" ]; then
-          echo "::warning ::Version $OLD is published but untagged. Resuming to finish the release."
-          RESUME=true
-        elif [ "$STATE" = "unpublished" ] && git ls-remote --exit-code origin "refs/tizen-release/v$OLD" >/dev/null 2>&1; then
-          echo "::notice ::Version $OLD is already reserved on this repository. Resuming."
-          RESUME=true
-        fi
+          # Only consider reservations made for these exact release inputs. A reservation
+          # for another branch, SDK or band belongs to a different release and must never
+          # be adopted by this one.
+          if ! python3 scripts/release-reservation.py verify \
+                 --payload-file "$RUNNER_TEMP/payload.txt" \
+                 --expect-version "$V" \
+                 --expect-sdk "$SDK" \
+                 --expect-band "$BAND" \
+                 --expect-branch "$BRANCH" \
+                 --expect-manifest-id "$MANIFEST_ID" \
+                 --expect-packages "$PACKAGES" >/dev/null 2>&1; then
+            continue
+          fi
 
-        if [ "$RESUME" = "true" ]; then
-          VER="$OLD"
-          # The reservation records the commit the artifacts must be built from. Everything
-          # in a resumed run is rebuilt from that SHA so the retry cannot publish packages
-          # stamped with a different commit than the ones already on the feed.
-          RES_SHA="$(git ls-remote origin "refs/tizen-release/v$VER" | cut -f1)"
-          if [ -z "$RES_SHA" ]; then
-            echo "::error::Resuming $VER but no reservation ref exists. Refusing to guess the release commit."
+          # It is ours. Is it finished?
+          STATE_OUT="$(python3 scripts/release-state.py --version "$V" --band "$BAND")"
+          STATE="$(echo "$STATE_OUT" | sed -n 's/^state=//p')"
+          if gh release view "v$V" >/dev/null 2>&1; then RELEASED=true; else RELEASED=false; fi
+          if [ "$STATE" = "published" ] && [ "$RELEASED" = "true" ]; then
+            continue
+          fi
+
+          if [ -n "$RESUME_VER" ]; then
+            echo "::error::More than one unfinished reservation matches these inputs (v$RESUME_VER and v$V). Resolve this by hand."
             exit 1
           fi
-          echo "Reserved release commit: $RES_SHA"
-          echo "workload_version=$VER" >> "$GITHUB_OUTPUT"
-          echo "release_sha=$RES_SHA" >> "$GITHUB_OUTPUT"
+          RESUME_VER="$V"
+          RESUME_SHA="$(python3 scripts/release-reservation.py verify \
+                          --payload-file "$RUNNER_TEMP/payload.txt" --print-field sha)"
+          echo "::warning ::Reservation v$V is unfinished (state=$STATE, released=$RELEASED). Resuming it."
+        done
+
+        if [ -n "$RESUME_VER" ]; then
+          echo "Resuming v$RESUME_VER from reserved commit $RESUME_SHA"
+          echo "workload_version=$RESUME_VER" >> "$GITHUB_OUTPUT"
+          echo "release_sha=$RESUME_SHA" >> "$GITHUB_OUTPUT"
+          echo "resumed=true" >> "$GITHUB_OUTPUT"
           exit 0
         fi
 
-        # Fresh release: compute the candidate ONCE and write that exact value. Calling the
-        # script a second time with --apply would re-query the feed and could persist a
+        # ------------------------------------------------------------------
+        # Fresh release. Compute the candidate ONCE and write that exact value; calling
+        # the script again with --apply would re-query the feed and could persist a
         # different version if another release landed in between.
+        # ------------------------------------------------------------------
         NEW=$(python3 scripts/next-workload-version.py)
         echo "Candidate: $NEW"
 
         if git ls-remote --exit-code origin "refs/tizen-release/v$NEW" >/dev/null 2>&1; then
-          echo "::error::Version $NEW is already reserved by another release. Aborting."
+          echo "::error::Version $NEW is already reserved by a release with different inputs. Aborting."
           exit 1
         fi
 
+        # An explicit --set-version equal to the value already on disk is a no-op, not a
+        # failure: a previous run bumped the file but never reached the reservation. This
+        # runs OUTSIDE a condition under `set -e`, so a non-zero exit here would kill the
+        # step and make the recovery path below unreachable.
         python3 scripts/next-workload-version.py --apply --set-version "$NEW" --verbose
         cd ..
         git config user.name  "github-actions[bot]"
         git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
         git add workload/build/Versions.props
         if git diff --cached --quiet; then
-          # OLD == NEW: the branch already carries the intended, still-unpublished version
-          # (a previous run bumped but never reserved). There is nothing to commit, so the
-          # current HEAD IS the release commit. Reserve it rather than failing.
           echo "::notice ::TizenWorkloadVersion is already $NEW; reserving the current commit."
         else
           git commit -m "chore: bump TizenWorkloadVersion to ${NEW}"
         fi
         RELEASE_SHA="$(git rev-parse HEAD)"
 
-        # Claim ownership atomically. A non-fast-forward create is rejected, so if two runs
-        # race, exactly one wins and the loser aborts here rather than publishing.
-        if ! git push origin "$RELEASE_SHA:refs/tizen-release/v$NEW"; then
+        # The reservation carries the complete release input set, so a later run can prove
+        # it is entitled to continue this exact release and cannot adopt it for a different
+        # SDK/band/branch.
+        PAYLOAD="$(python3 workload/scripts/release-reservation.py encode \
+                     --version "$NEW" --sha "$RELEASE_SHA" --sdk "$SDK" --band "$BAND" \
+                     --manifest-id "$MANIFEST_ID" --packages "$PACKAGES" --branch "$BRANCH")"
+        git tag -f -a "tizen-reserve-$NEW" -m "tizen-release reservation v$NEW
+
+        $PAYLOAD" "$RELEASE_SHA"
+
+        # Atomic compare-and-swap CREATE: an empty expected value requires the ref to not
+        # exist yet, so if two runs race exactly one wins and the loser aborts here rather
+        # than publishing over someone else's version.
+        if ! git push origin "refs/tags/tizen-reserve-$NEW:refs/tizen-release/v$NEW" \
+               --force-with-lease="refs/tizen-release/v$NEW:"; then
           echo "::error::Failed to reserve $NEW (another release won the race). Aborting."
           exit 1
         fi
@@ -157,6 +206,7 @@ jobs:
 
         echo "workload_version=$NEW" >> "$GITHUB_OUTPUT"
         echo "release_sha=$RELEASE_SHA" >> "$GITHUB_OUTPUT"
+        echo "resumed=false" >> "$GITHUB_OUTPUT"
         echo "::notice ::Reserved and bumped TizenWorkloadVersion: $OLD -> $NEW at $RELEASE_SHA"
 
     # Build from the RESERVED commit, never from whatever the branch or the re-run event
@@ -359,12 +409,28 @@ jobs:
             [ -n "$v" ] && echo "- https://www.nuget.org/packages/Samsung.Tizen.Ref.API${api}/${v}"
           done
         } > "$RUNNER_TEMP/release-notes.md"
+        SHA="${{ steps.bump.outputs.release_sha }}"
         if gh release view "v${VER}" >/dev/null 2>&1; then
-          echo "::notice ::Release v${VER} already exists; skipping creation (resumed run)."
+          # An existing tag is only the intended artifact if it points at the reserved
+          # commit. Blindly treating "the tag exists" as done would bless a release whose
+          # tag targets a different tree than the packages that were published - exactly
+          # the mixed-provenance state the reservation exists to prevent.
+          git fetch origin "refs/tags/v${VER}:refs/tags/v${VER}" --force >/dev/null 2>&1 || true
+          TAG_SHA="$(git rev-parse "refs/tags/v${VER}^{commit}" 2>/dev/null || echo "")"
+          if [ -z "$TAG_SHA" ]; then
+            echo "::error::Release v${VER} exists but its tag could not be resolved to a commit."
+            exit 1
+          fi
+          if [ "$TAG_SHA" != "$SHA" ]; then
+            echo "::error::Release v${VER} is tagged at $TAG_SHA but this version was reserved at $SHA."
+            echo "::error::Refusing to accept a release whose tag does not match the reserved release commit."
+            exit 1
+          fi
+          echo "::notice ::Release v${VER} already exists at the reserved commit $SHA; nothing to do."
           exit 0
         fi
         gh release create "v${VER}" \
-          --target "${{ steps.bump.outputs.release_sha }}" \
+          --target "$SHA" \
           --title "Tizen Workload ${VER} - .Net ${MAJOR_MINOR}" \
           --notes-file "$RUNNER_TEMP/release-notes.md" \
           --generate-notes

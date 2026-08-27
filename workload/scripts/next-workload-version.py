@@ -9,7 +9,7 @@ package published on NuGet, finding the largest globally-sequential build counte
 and returning it incremented by 1.
 
 Rationale
-=========
+---------
 TizenWorkloadVersion uses the format `<TizenOSMajor>.<TizenOSMinor>.<buildSeq>` where
 `buildSeq` increments by 1 per release REGARDLESS of which .NET SDK band the release
 targets. Every active branch (main, net7.0, net8.0, net9.0, net10.0) draws from the
@@ -17,7 +17,7 @@ same `buildSeq` pool. NuGet is the source of truth: the next number must be 1 mo
 than the largest `buildSeq` ever published, irrespective of sdkBand or branch.
 
 Algorithm
-=========
+---------
 1. Query NuGet's search index for all packages whose id starts with
    `samsung.net.sdk.tizen.manifest-`. This returns one entry per sdkBand (one
    package per band, e.g. ...-7.0.400, ...-8.0.100-rtm, etc.).
@@ -28,7 +28,7 @@ Algorithm
 5. Print `<major>.<minor>.<buildSeq+1>` on stdout (single line, no extras).
 
 Usage
-=====
+-----
     # Print only:
     python3 workload/scripts/next-workload-version.py
 
@@ -39,7 +39,7 @@ Usage
     python3 workload/scripts/next-workload-version.py --verbose
 
 Notes
-=====
+-----
 - Reads no local files; relies only on what is published to nuget.org. This is
   intentional: published artifacts are the authoritative shared sequence; uncommitted
   Versions.props bumps cannot influence the answer.
@@ -50,6 +50,7 @@ Notes
 from __future__ import annotations
 import argparse
 import json
+import os
 import re
 import sys
 import urllib.error
@@ -57,17 +58,24 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+# Overridable so the tests can point the queries at a local stub feed. Defaults are the
+# production endpoints; nothing in CI or a real release sets these.
+SEARCH_BASE = os.environ.get("TIZEN_NUGET_SEARCH_BASE", "https://azuresearch-usnc.nuget.org/query")
+FLATCONTAINER_BASE = os.environ.get(
+    "TIZEN_NUGET_FEED_BASE", "https://api.nuget.org/v3-flatcontainer"
+)
+
 SEARCH_URL = (
-    "https://azuresearch-usnc.nuget.org/query"
-    "?q=packageid:samsung.net.sdk.tizen.manifest"
-    "&prerelease=true&semVerLevel=2.0.0&take=200"
+    SEARCH_BASE + "?q=packageid:samsung.net.sdk.tizen.manifest"
+    "&prerelease=true&semVerLevel=2.0.0"
 )
 SEARCH_FALLBACK_URL = (
-    "https://azuresearch-usnc.nuget.org/query"
-    "?q=samsung.net.sdk.tizen.manifest"
-    "&prerelease=true&semVerLevel=2.0.0&take=200"
+    SEARCH_BASE + "?q=samsung.net.sdk.tizen.manifest"
+    "&prerelease=true&semVerLevel=2.0.0"
 )
-FLATCONTAINER_FMT = "https://api.nuget.org/v3-flatcontainer/{id}/index.json"
+PAGE_SIZE = 200
+
+FLATCONTAINER_FMT = FLATCONTAINER_BASE.rstrip("/") + "/{id}/index.json"
 
 VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$")
 
@@ -80,25 +88,102 @@ def fetch_json(url: str, timeout: int = 15) -> dict:
         raise SystemExit(f"network error fetching {url}: {e}")
 
 
-def find_manifest_package_ids(verbose: bool = False) -> list[str]:
-    """Return lowercase ids of every published samsung.net.sdk.tizen.manifest-* package."""
+def search_page(url_base: str, skip: int, take: int) -> tuple[int, list]:
+    """One page of a NuGet search query, with the response strictly validated.
+
+    Returns (totalHits, entries). Every structural surprise raises: a search response we
+    cannot fully understand must never be reduced to "fewer packages exist".
+    """
+    url = "{0}&skip={1}&take={2}".format(url_base, skip, take)
+    data = fetch_json(url)
+    if not isinstance(data, dict):
+        raise SystemExit(f"unexpected search response for {url}: not a JSON object")
+    if "totalHits" not in data:
+        raise SystemExit(f"search response for {url} has no 'totalHits'; refusing to guess")
+    total = data["totalHits"]
+    if not isinstance(total, int) or isinstance(total, bool) or total < 0:
+        raise SystemExit(f"search response for {url} has a bad 'totalHits': {total!r}")
+    entries = data.get("data")
+    if not isinstance(entries, list):
+        raise SystemExit(
+            f"search response for {url} has a non-list 'data': {type(entries).__name__}"
+        )
+    return total, entries
+
+
+def collect_ids(url_base: str, verbose: bool = False) -> set[str]:
+    """Every matching package id from url_base, paginating until totalHits is satisfied.
+
+    The search endpoint caps `take`, so a single request silently returned only the first
+    page. Reading one page and treating it as the whole world meant a band whose entry fell
+    on page 2 was invisible - and if that band held the highest build counter, the derived
+    "next" version collided with one already published. Pagination continues until the
+    number of entries seen matches totalHits; anything less is a hard error.
+    """
     out: set[str] = set()
-    for url in (SEARCH_URL, SEARCH_FALLBACK_URL):
-        try:
-            data = fetch_json(url)
-        except SystemExit:
-            continue
-        for entry in data.get("data", []):
-            pid = entry.get("id", "").lower()
+    skip = 0
+    seen = 0
+    total: int | None = None
+    while True:
+        page_total, entries = search_page(url_base, skip, PAGE_SIZE)
+        if total is None:
+            total = page_total
+        elif page_total != total:
+            raise SystemExit(
+                f"totalHits changed mid-pagination ({total} -> {page_total}); the feed is "
+                f"not stable enough to derive a version from."
+            )
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise SystemExit(f"unexpected search entry: {type(entry).__name__}")
+            pid = entry.get("id", "")
+            if not isinstance(pid, str):
+                raise SystemExit(f"unexpected package id: {pid!r}")
+            pid = pid.lower()
             # Accept both exact 'samsung.net.sdk.tizen.manifest' (no suffix, unusual)
             # and the typical '-<band>' suffix forms.
             if pid.startswith("samsung.net.sdk.tizen.manifest"):
                 out.add(pid)
-        if out:
+        seen += len(entries)
+        if seen >= total:
             break
+        if not entries:
+            # More were promised than delivered: stop rather than spin, and fail closed.
+            raise SystemExit(
+                f"search returned {seen} of {total} promised entries for {url_base}; "
+                f"refusing to derive a version from an incomplete package list."
+            )
+        skip += len(entries)
     if verbose:
-        print(f"[verbose] discovered {len(out)} manifest package ids", file=sys.stderr)
-    return sorted(out)
+        print(
+            f"[verbose] {url_base}: {seen}/{total} entries, {len(out)} manifest ids",
+            file=sys.stderr,
+        )
+    return out
+
+
+def find_manifest_package_ids(verbose: bool = False) -> list[str]:
+    """Return lowercase ids of every published samsung.net.sdk.tizen.manifest-* package."""
+    problems: list[str] = []
+    for url in (SEARCH_URL, SEARCH_FALLBACK_URL):
+        try:
+            out = collect_ids(url, verbose=verbose)
+        except SystemExit as exc:
+            # Remember it: if every query form fails we must abort rather than proceed
+            # with no data, which would look exactly like "nothing is published yet".
+            problems.append(f"{url}: {exc}")
+            continue
+        if out:
+            if verbose:
+                print(f"[verbose] discovered {len(out)} manifest package ids", file=sys.stderr)
+            return sorted(out)
+    if problems:
+        raise SystemExit(
+            "could not enumerate the manifest packages: "
+            + "; ".join(problems)
+            + ". Refusing to derive a version from incomplete feed data."
+        )
+    return []
 
 
 def fetch_versions(pid: str, verbose: bool = False) -> list[str]:
@@ -157,7 +242,9 @@ def find_max_triple(verbose: bool = False) -> tuple[int, int, int]:
     return best
 
 
-def update_versions_props(versions_props: Path, new_value: str, verbose: bool = False) -> int:
+def update_versions_props(
+    versions_props: Path, new_value: str, verbose: bool = False, allow_noop: bool = False
+) -> int:
     text = versions_props.read_text(encoding="utf-8")
     m = re.search(r"<TizenWorkloadVersion>([^<]+)</TizenWorkloadVersion>", text)
     if not m:
@@ -172,6 +259,13 @@ def update_versions_props(versions_props: Path, new_value: str, verbose: bool = 
         raise SystemExit(f"unparseable current version: {current!r}")
     if new_t is None:
         raise SystemExit(f"unparseable new version: {new_value!r}")
+
+    if allow_noop and new_t == cur_t:
+        print(
+            f"TizenWorkloadVersion is already {new_value}; nothing to write.",
+            file=sys.stderr,
+        )
+        return 0
 
     if new_t <= cur_t:
         print(
@@ -222,7 +316,12 @@ def main() -> int:
         else:
             # script is in workload/scripts/, so Versions.props is sibling-of-parent/build/
             vp = Path(__file__).resolve().parents[1] / "build" / "Versions.props"
-        rc = update_versions_props(vp, next_value, verbose=args.verbose)
+        # An explicit --set-version that equals what is already on disk is the resume
+        # case: a previous run bumped the file but never got as far as reserving it.
+        # That is a no-op, not a failure - the caller reserves the current commit.
+        rc = update_versions_props(
+            vp, next_value, verbose=args.verbose, allow_noop=bool(args.set_version)
+        )
         # Always echo the computed value so CI/scripts can capture it.
         print(next_value)
         return rc

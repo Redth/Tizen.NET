@@ -139,33 +139,99 @@ fi
 echo ""
 echo "-- fallback band family --"
 
-FALLBACK_CASES=(
-    "samsung.net.sdk.tizen.manifest-11.0.100-preview.7|samsung.net.sdk.tizen.manifest-11.0."
-    "samsung.net.sdk.tizen.manifest-10.0.300|samsung.net.sdk.tizen.manifest-10.0."
-    "samsung.net.sdk.tizen.manifest-9.0.100-rc.1|samsung.net.sdk.tizen.manifest-9.0."
-    "samsung.net.sdk.tizen.manifest-6.0.400|samsung.net.sdk.tizen.manifest-6.0."
+# The SHIPPED resolver is extracted and invoked directly. The previous version of this
+# block re-implemented the family-prefix rule with its own sed, so it agreed with itself
+# no matter what workload-install.sh actually did - it could never detect drift.
+RESOLVER="$(sed -n '/^MANIFEST_BASE_NAME=/p;/# BEGIN AUTO-GENERATED VERSION MAP/,/# END AUTO-GENERATED VERSION MAP/p;/# BEGIN VERSION BAND DETECTION/,/# END VERSION BAND DETECTION/p;/# BEGIN FALLBACK RESOLVER/,/# END FALLBACK RESOLVER/p' "$SH_SCRIPT")"
+eval "$RESOLVER"
+
+if ! declare -f getLatestVersion >/dev/null; then
+    printf "  %sFAIL%s  %s\n" "$c_red" "$c_reset" "could not extract getLatestVersion from workload-install.sh"
+    fail=$((fail + 1))
+else
+    printf "  %sPASS%s  %s\n" "$c_green" "$c_reset" "the shipped resolver is the one under test"
+    pass=$((pass + 1))
+fi
+
+M="samsung.net.sdk.tizen.manifest"
+
+# id|expected resolver output ('' means must fail closed)
+RESOLVER_CASES=(
+    # exact hits come straight from the map
+    "$M-10.0.100|$M-10.0.100=10.0.123"
+    "$M-6.0.400|$M-6.0.400=9.0.104"
+    # closest band AT OR BELOW the request - never a newer one
+    "$M-10.0.200|$M-10.0.100=10.0.123"
+    "$M-10.0.400|$M-10.0.300=10.0.127"
+    "$M-9.0.400|$M-9.0.300=10.0.121"
+    # must never cross the major.minor family
+    "$M-11.0.100-preview.7|"
+    "$M-11.0.100|"
+    # nothing older exists in the family
+    "$M-6.0.050|"
+    # unparseable family fails closed rather than guessing
+    "$M-bogus|"
 )
 
-for case in "${FALLBACK_CASES[@]}"; do
-    mid="${case%%|*}"
+for case in "${RESOLVER_CASES[@]}"; do
+    id="${case%%|*}"
     want="${case##*|}"
-    family="${mid#*-}"
-    family="$(echo "$family" | sed -E 's/^([0-9]+\.[0-9]+)\..*/\1/')"
-    got="${mid%%-*}-${family}."
+    got="$(getLatestVersion "$id")"
     if [[ "$got" == "$want" ]]; then
-        printf "  %sPASS%s  %-48s -> %s\n" "$c_green" "$c_reset" "$mid" "$got"
+        printf "  %sPASS%s  %-48s -> %s\n" "$c_green" "$c_reset" "$id" "${got:-<none>}"
         pass=$((pass + 1))
     else
-        printf "  %sFAIL%s  %-48s -> %s (expected %s)\n" "$c_red" "$c_reset" "$mid" "$got" "$want"
+        printf "  %sFAIL%s  %-48s -> %s (expected %s)\n" "$c_red" "$c_reset" "$id" "${got:-<none>}" "${want:-<none>}"
         fail=$((fail + 1))
     fi
 done
 
-# The 11.x family prefix must not match any 10.x map key.
-if grep -q 'MANIFEST_BASE_NAME-10\.' "$SH_SCRIPT" && \
-   ! grep -q '"\$MANIFEST_BASE_NAME-11\.0\.' "$SH_SCRIPT"; then
-    printf "  %sPASS%s  %-48s\n" "$c_green" "$c_reset" "11.0 family has no map entry (fallback must fail closed)"
-    pass=$((pass + 1))
+# --- SemVer ordering of pre-release bands -------------------------------------
+#
+# band_sort_key appended the pre-release raw and the comparison is a string compare, so
+# "preview.10" sorted BELOW "preview.9" ('1' < '9'). A request against a preview.10 band
+# would then fall back to preview.9. Ordering is asserted on the real function.
+
+echo ""
+echo "-- SemVer band ordering --"
+
+ORDERED=(
+    "8.0.100-alpha.1"
+    "11.0.100-preview.7"
+    "11.0.100-preview.9"
+    "11.0.100-preview.10"
+    "11.0.100-rc.1"
+    "11.0.100-rtm"
+    "11.0.100"
+)
+prev=""
+prev_band=""
+for band in "${ORDERED[@]}"; do
+    key="$(band_sort_key "$band")"
+    if [[ -z "$prev" || "$key" > "$prev" ]]; then
+        printf "  %sPASS%s  %-24s sorts above %s\n" "$c_green" "$c_reset" "$band" "${prev_band:-<start>}"
+        pass=$((pass + 1))
+    else
+        printf "  %sFAIL%s  %-24s does NOT sort above %s\n" "$c_red" "$c_reset" "$band" "$prev_band"
+        fail=$((fail + 1))
+    fi
+    prev="$key"; prev_band="$band"
+done
+
+# sh/ps1 parity on the real functions, not on a description of them.
+if command -v pwsh >/dev/null 2>&1; then
+    PS_KEYFUNC="$(sed -n '/function Get-BandSortKey/,/^}/p' "$PS1_SCRIPT")"
+    for band in "${ORDERED[@]}"; do
+        sh_key="$(band_sort_key "$band")"
+        ps_key="$(pwsh -NoProfile -Command "$PS_KEYFUNC; Get-BandSortKey -Band '$band'" 2>/dev/null | tr -d '\r')"
+        if [[ "$sh_key" == "$ps_key" ]]; then
+            printf "  %sPASS%s  %-24s sh/ps1 key parity\n" "$c_green" "$c_reset" "$band"
+            pass=$((pass + 1))
+        else
+            printf "  %sFAIL%s  %-24s sh=%s ps1=%s\n" "$c_red" "$c_reset" "$band" "$sh_key" "$ps_key"
+            fail=$((fail + 1))
+        fi
+    done
 fi
 
 # --- producer/consumer parity: Config.mk must agree with the installers -------
@@ -214,6 +280,35 @@ if command -v make >/dev/null 2>&1; then
             pass=$((pass + 1))
         else
             printf "  %sFAIL%s  %-24s same for both bands (%s)\n" "$c_red" "$c_reset" "$var" "$a"
+            fail=$((fail + 1))
+        fi
+    done
+
+    # Isolation must also hold WITHIN a band. 10.0.100 and 10.0.101 share a feature band,
+    # so a band-keyed cache handed the second one the first one's SDK - the build then
+    # silently tested an SDK it was never asked for. The SDK directory and stamp are keyed
+    # by the FULL version; only the manifest path stays band-based.
+    for pair in "10.0.100|10.0.101" "11.0.100-preview.7.26381.103|11.0.100-preview.7.26999.1"; do
+        v1="${pair%%|*}"; v2="${pair##*|}"
+        for var in print-dotnet-destdir print-install-stamp; do
+            a="$(DOTNET_VERSION=$v1 make -s -C "$WORKLOAD_DIR" $var 2>/dev/null | tail -1)"
+            b="$(DOTNET_VERSION=$v2 make -s -C "$WORKLOAD_DIR" $var 2>/dev/null | tail -1)"
+            if [[ -n "$a" && -n "$b" && "$a" != "$b" ]]; then
+                printf "  %sPASS%s  %-24s differs for %s vs %s\n" "$c_green" "$c_reset" "$var" "$v1" "$v2"
+                pass=$((pass + 1))
+            else
+                printf "  %sFAIL%s  %-24s identical for %s and %s (%s)\n" "$c_red" "$c_reset" "$var" "$v1" "$v2" "$a"
+                fail=$((fail + 1))
+            fi
+        done
+        # ...while the manifest band deliberately stays shared.
+        ba="$(DOTNET_VERSION=$v1 make -s -C "$WORKLOAD_DIR" print-version-band 2>/dev/null | tail -1)"
+        bb="$(DOTNET_VERSION=$v2 make -s -C "$WORKLOAD_DIR" print-version-band 2>/dev/null | tail -1)"
+        if [[ -n "$ba" && "$ba" == "$bb" ]]; then
+            printf "  %sPASS%s  %-24s shared by %s and %s (%s)\n" "$c_green" "$c_reset" "manifest band" "$v1" "$v2" "$ba"
+            pass=$((pass + 1))
+        else
+            printf "  %sFAIL%s  %-24s %s=%s but %s=%s\n" "$c_red" "$c_reset" "manifest band" "$v1" "$ba" "$v2" "$bb"
             fail=$((fail + 1))
         fi
     done

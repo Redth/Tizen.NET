@@ -288,14 +288,38 @@ Both remediations are applied:
 1. **The file is now well-formed** — a single `<FileList>` root. The pack is a placeholder that
    ships no runtime binaries (its only payload is `lib/net6.0-tizen/_._`), so the list is
    legitimately empty.
-2. **Self-contained Tizen publishing is rejected up front** with `TIZENSDK001`, explaining that
-   Tizen applications run against the platform-provided runtime. Without it, the build failed
-   with the opaque `NETSDK1083: The specified RuntimeIdentifier 'tizen' is not recognized`.
+2. **Explicitly requested self-contained Tizen publishing is rejected up front** with
+   `TIZENSDK001`, explaining that Tizen applications run against the platform-provided runtime.
+   Without it, the build failed with the opaque `NETSDK1083: The specified RuntimeIdentifier
+   'tizen' is not recognized`.
 
-Verified on `11.0.100-preview.7.26381.103`: `dotnet build -p:SelfContained=true` on a
-`net11.0-tizen11.0` project now fails with `TIZENSDK001` and the actionable message.
+The guard (`_TizenErrorOnSelfContained` in `Samsung.Tizen.Sdk.targets`) gates on the SDK's
+`_SelfContainedWasSpecified`, **not** on the final `$(SelfContained)` value, and this distinction
+is load-bearing. The .NET SDK (`Microsoft.NET.RuntimeIdentifierInference.targets`) still *infers*
+`SelfContained=true` from a present `RuntimeIdentifier` on pre-8.0 TFMs, and the Tizen SDK
+supplies an implicit RID (`tizen-x86`) for MAUI apps. Gating on the inferred `$(SelfContained)`
+therefore mis-classified an ordinary **framework-dependent** `net6.0-tizen` / `net7.0-tizen` build
+— exactly what every existing .NET MAUI Tizen consumer does — as self-contained and broke it.
+`_SelfContainedWasSpecified` is set by the SDK only when self-contained was *explicitly* requested
+(`-p:SelfContained=true`, or `PublishSelfContained=true` during publish, which the SDK copies onto
+`SelfContained` before computing `_SelfContainedWasSpecified`), so the guard now fires on explicit
+requests only.
+
+Verified empirically on `11.0.100-preview.7.26381.103` (`dotnet msbuild -nodereuse:false`,
+`OutputType=Exe`, implicit RID `tizen-x86`):
+
+| Build | inferred `SelfContained` | `_SelfContainedWasSpecified` | TIZENSDK001 |
+| --- | --- | --- | --- |
+| `net6.0-tizen`, framework-dependent | `true` | *(empty)* | **no** (was wrongly yes) |
+| `net7.0-tizen`, framework-dependent | `true` | *(empty)* | **no** (was wrongly yes) |
+| `net8.0`–`net11.0-tizen*`, framework-dependent | `false` | *(empty)* | no |
+| any `-tizen*` with `-p:SelfContained=true` | `true` | `true` | **yes** |
+| any `-tizen*` publish `-p:PublishSelfContained=true` | `true` | `true` | **yes** |
+
 `SkipTizenSelfContainedCheck=true` bypasses the guard for anyone supplying a runtime by other
-means.
+means. These behaviours are locked down by `test-template-conditions.sh`, which extracts the real
+guard `<Target>` from the shipped targets and asserts each row above without needing the Tizen
+workload.
 
 **Scope note, stated precisely:** with the guard bypassed *and* the old malformed file restored,
 this configuration failed at `NETSDK1083` (RID resolution) *before* reaching
@@ -330,6 +354,31 @@ The release workflow **reserves first, then builds**:
 published on NuGet, so when the branch already carries the intended still-unpublished version
 the run resumes it; there is simply nothing to commit, and the current HEAD *is* the release
 commit, so it is reserved as-is. Re-creating an existing tag is a no-op.
+
+### What a reservation records
+
+A reservation used to be nothing but a ref pointing at a commit. That answers *"is this
+version taken"* but not *"is this run allowed to continue it"*, and both gaps were real:
+
+* **Re-runs could never resume their own release.** `Re-run jobs` checks out the SHA of the
+  *original* event — the commit *before* the version bump — so the version read from
+  `Versions.props` was the previous, already-released one. The re-run concluded there was
+  nothing to resume, recomputed the same candidate, found its own reservation ref and
+  aborted as though a stranger held it. An interrupted release was permanently unfinishable.
+* **Nothing tied a reservation to the inputs it was made for**, so re-dispatching with a
+  different `net_sdk_version` would adopt a reservation created for another band.
+
+`refs/tizen-release/v<V>` is therefore an *annotated tag object* whose message carries the
+complete release input set — version, reserved SHA, SDK, band, manifest id, package set and
+branch (`scripts/release-reservation.py`). Resume is decided by **enumerating** those refs
+and matching them against the current run's inputs; the checked-out SHA is no longer used
+for that decision at all. A reservation that does not match every input is skipped, and one
+that predates the payload format cannot be validated and so is refused rather than trusted.
+Two unfinished reservations matching the same inputs is an error, not a guess.
+
+An existing tag is only accepted as "already done" when it resolves to the reserved commit.
+Treating mere existence as done would bless a release whose tag targets a different tree
+than the packages that were published.
 
 ### Reservation and concurrency
 
@@ -418,3 +467,68 @@ reuses a stale SDK that merely shares a feature band. Manifest paths remain band
 
 Shell tests run under stock macOS Bash 3.2 (no `${var,,}`), and cover spaced paths, empty and
 transport-failed version queries, and mixed-band `UpdateAllWorkloads`.
+
+
+## Deriving the next version from the feed
+
+`next-workload-version.py` picks the next global build counter from what is published, so
+every question it asks the feed has to fail closed:
+
+* **The search index is paginated.** The endpoint caps results per request, so a single
+  query saw only the first page. If the band holding the highest counter fell on a later
+  page it was invisible and the derived "next" version collided with one already published.
+  Pagination now continues until the number of entries seen matches `totalHits`, and a
+  response that delivers fewer than it promised, omits `totalHits`, or returns a
+  non-integer `totalHits` or non-list `data` aborts the run.
+* **A 200 that cannot be parsed is not an empty package.** `release-state.py` read
+  `payload.get("versions", [])`, so `{}` — a truncated or error-shaped body — made a
+  published package look missing. That downgrades `published` to `partial`, or makes a
+  partial release look unpublished and advances past it. Only a genuine 404 (or a missing
+  file on the `file://` feed used by the tests) means "never published".
+
+`--set-version` equal to the value already on disk is an **idempotent no-op, not a failure**.
+It is called outside a condition under `set -e`, so returning non-zero killed the step and
+made the documented "reserve the current commit" recovery below it unreachable. Writing a
+*lower* version is still refused.
+
+## Installer band selection, continued
+
+**The manifest package always follows the target band.** The manifest is named after the
+band it is *for*, but the id was derived from the running SDK and only corrected on the
+auto-derived path. `-t 10.0.200` on a 10.0.100 SDK therefore downloaded
+`samsung.net.sdk.tizen.manifest-10.0.100` and installed it into `sdk-manifests/10.0.200` —
+the wrong band's manifest in the right band's directory, reported as success.
+
+**Pre-release bands are ordered by SemVer precedence.** The sort key appended the
+pre-release verbatim and the comparison is a string compare, so `preview.10` sorted *below*
+`preview.9` (`'1' < '9'`) and a request against a `preview.10` band silently fell back to
+`preview.9`. Numeric identifiers are now zero-padded and tagged, alphanumeric ones tagged
+separately (numeric sorts below alphanumeric, as SemVer requires). The shell and PowerShell
+keys are asserted byte-identical.
+
+**Installing is one transaction.** A partial install is worse than none: the shell installer
+left `global.json` pinned when a download failed — so the next iteration of an
+`--update-all-workloads` run overwrote the user's real `global.json.bak` and destroyed it —
+and a failed pack install left a new manifest advertising packs that were not on disk, so
+every later build against that band failed with an unrelated-looking error. The PowerShell
+installer was worse still: it *removed* the old manifest and packs before fetching the new
+ones, so a mid-way failure left no workload at all. Both now roll the SDK back to exactly
+its previous state on any failure, including restoring `global.json` verbatim.
+
+## Testing the shipped code
+
+The fallback tests used to re-implement the family-prefix rule with their own `sed`, so they
+agreed with themselves no matter what the installer did and could never detect drift. The
+resolver is now delimited by `# BEGIN/END FALLBACK RESOLVER` markers, extracted, and invoked
+directly — as `compute_target_version_band` and `band_sort_key` already were. Regressing
+`band_sort_key` to its previous form makes the suite fail, which is the property that
+matters.
+
+The package set lives in three places — the workflow's push loop, `release-state.py`, and
+the reservation payload — and is now checked in **both** directions. The old check only
+verified that everything pushed was tracked; a package tracked but never pushed could never
+become present, so the completeness gate would retry until it gave up and the version could
+never be tagged.
+
+SDK bootstrap directories and install stamps are keyed by the **full** SDK version, so
+`10.0.100` and `10.0.101` do not share a tree, while the manifest path stays band-based.

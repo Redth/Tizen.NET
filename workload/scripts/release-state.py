@@ -21,14 +21,14 @@ This script makes that state explicit so the workflow can resume V instead of ad
 NuGet packages are immutable, so "already present" is always safe to skip.
 
 States
-======
+------
   unpublished  none of the expected packages exist for V
   partial      some (but not all) expected packages exist for V
   published    every expected package exists for V
                (the caller still has to check the tag/release before treating V as done)
 
 Outputs
-=======
+-------
 Emits `key=value` lines suitable for appending to $GITHUB_OUTPUT:
 
   state=unpublished|partial|published
@@ -36,12 +36,12 @@ Emits `key=value` lines suitable for appending to $GITHUB_OUTPUT:
   missing=<comma-separated package ids that do not>
 
 Exit codes
-==========
+----------
   0  state determined
   2  the feed could not be reached (caller must NOT advance the version on this)
 
 Testing
-=======
+-------
 `--feed-base` (or TIZEN_NUGET_FEED_BASE) overrides the flatcontainer base URL, so tests can
 point at a local directory of `<id>/index.json` files via a file:// URL.
 """
@@ -83,7 +83,31 @@ def feed_versions(feed_base: str, package_id: str) -> list:
         if url.startswith("file:") and isinstance(exc.reason, FileNotFoundError):
             return []
         raise
-    return [v for v in payload.get("versions", []) if v]
+
+    # Only a 404 means "never published". A 200 carrying something we cannot parse is a
+    # malformed response, and must NOT be read as absence: `{}` previously yielded [] via
+    # .get("versions", []), so a truncated or error-shaped body made a published package
+    # look missing - which downgrades `published` to `partial` and re-publishes, or worse
+    # makes a partial release look unpublished and advances past it.
+    if not isinstance(payload, dict):
+        raise ValueError(
+            "malformed index for {0}: expected a JSON object, got {1}".format(
+                package_id, type(payload).__name__
+            )
+        )
+    if "versions" not in payload:
+        raise ValueError(
+            "malformed index for {0}: no 'versions' key. A 200 response that cannot be "
+            "parsed is not the same as a package that was never published.".format(package_id)
+        )
+    versions = payload["versions"]
+    if not isinstance(versions, list):
+        raise ValueError(
+            "malformed index for {0}: 'versions' is {1}, expected a list".format(
+                package_id, type(versions).__name__
+            )
+        )
+    return [v for v in versions if v]
 
 
 def main() -> int:

@@ -260,8 +260,22 @@ function Get-BandSortKey([string]$Band)
     $Parts = $Core.Split('.')
     $Major = [int]($Parts[0]); $Minor = [int]($Parts[1]); $Patch = [int]($Parts[2])
     if ($Pre) {
-        return ('{0:D5}{1:D5}{2:D5}0{3}' -f $Major, $Minor, $Patch, $Pre)
+        # Normalise the pre-release so a plain string comparison follows SemVer precedence.
+        # Appending it raw made the comparison lexicographic, where "preview.10" sorts
+        # BELOW "preview.9" because '1' < '9'. Numeric identifiers are zero-padded and
+        # tagged 0, alphanumeric ones tagged 1 (numeric < alphanumeric in SemVer).
+        # Must stay byte-identical to band_sort_key() in workload-install.sh.
+        $Normalised = ""
+        foreach ($Ident in $Pre.Split('.')) {
+            if ($Ident -match '^[0-9]+$') {
+                $Normalised += '.' + ('0{0:D10}' -f [int]$Ident)
+            } else {
+                $Normalised += '.1' + $Ident
+            }
+        }
+        return ('{0:D5}{1:D5}{2:D5}0{3}' -f $Major, $Minor, $Patch, $Normalised)
     }
+    # No pre-release: sorts above every pre-release of the same core version.
     return ('{0:D5}{1:D5}{2:D5}1' -f $Major, $Minor, $Patch)
 }
 
@@ -278,8 +292,12 @@ function Install-TizenWorkload([string]$DotnetVersion)
 
     if ($DotnetTargetVersionBand -eq "<auto>" -or $UpdateAllWorkloads.IsPresent) {
         $DotnetTargetVersionBand = Get-TargetVersionBand -DotnetVersion $DotnetVersion
-        $ManifestName = "$ManifestBaseName-$DotnetTargetVersionBand"
     }
+    # The manifest package is named after the band it is FOR, so it must always follow the
+    # target band - including an explicitly requested one. Deriving it from the running SDK
+    # meant `-Tizen 10.0.200` on a 10.0.100 SDK downloaded the 10.0.100 manifest and
+    # installed it into sdk-manifests\10.0.200. Matches workload-install.sh.
+    $ManifestName = "$ManifestBaseName-$DotnetTargetVersionBand"
 
     # Check latest version of manifest.
     #
@@ -348,27 +366,53 @@ function Install-TizenWorkload([string]$DotnetVersion)
     Ensure-Directory $ManifestDir
     $TempDir = $(New-TemporaryDirectory)
 
-    # Install workload manifest.
-    Write-Host "Installing $ManifestName/$Version to $ManifestDir..."
-    Install-Pack -Id $ManifestName -Version $Version -Kind "manifest"
-
-    # Download and install workload packs.
-    $NewManifestJson = $(Get-Content $TizenManifestFile | ConvertFrom-Json)
-    $NewManifestJson.packs.PSObject.Properties | ForEach-Object {
-        Write-Host "Installing $($_.Name)/$($_.Value.version)..."
-        Install-Pack -Id $_.Name -Version $_.Value.version -Kind $_.Value.kind
+    # The remove-then-install sequence below is destructive: the previous manifest and its
+    # packs are deleted BEFORE the new ones are fetched, so any failure in between used to
+    # leave the SDK with no Tizen workload at all - a worse state than before the run. The
+    # whole sequence is therefore one transaction, and the previous manifest is restored on
+    # any failure. Matches the tx_rollback handling in workload-install.sh.
+    $TxBackupDir = $null
+    if (Test-Path $TizenManifestDir) {
+        $TxBackupDir = Join-Path -Path $TempDir -ChildPath "manifest-backup"
+        Copy-Item -Path $TizenManifestDir -Destination $TxBackupDir -Recurse -Force
     }
+    $TxCommitted = $false
 
-    # Add tizen to the installed workload metadata.
-    # Featured version band for metadata does NOT include any preview specifier.
-    # https://github.com/dotnet/sdk/blob/main/documentation/general/workloads/user-local-workloads.md
-    New-Item -Path $(Join-Path -Path $DotnetInstallDir -ChildPath "metadata\workloads\$DotnetVersionBand\InstalledWorkloads\tizen") -Force | Out-Null
-    if (Test-Path $(Join-Path -Path $DotnetInstallDir -ChildPath "metadata\workloads\$DotnetVersionBand\InstallerType\msi")) {
-        New-Item -Path "HKLM:\SOFTWARE\Microsoft\dotnet\InstalledWorkloads\Standalone\x64\$DotnetTargetVersionBand\tizen" -Force | Out-Null
+    try {
+        # Install workload manifest.
+        Write-Host "Installing $ManifestName/$Version to $ManifestDir..."
+        Install-Pack -Id $ManifestName -Version $Version -Kind "manifest"
+
+        # Download and install workload packs.
+        $NewManifestJson = $(Get-Content $TizenManifestFile | ConvertFrom-Json)
+        $NewManifestJson.packs.PSObject.Properties | ForEach-Object {
+            Write-Host "Installing $($_.Name)/$($_.Value.version)..."
+            Install-Pack -Id $_.Name -Version $_.Value.version -Kind $_.Value.kind
+        }
+
+        # Add tizen to the installed workload metadata.
+        # Featured version band for metadata does NOT include any preview specifier.
+        # https://github.com/dotnet/sdk/blob/main/documentation/general/workloads/user-local-workloads.md
+        New-Item -Path $(Join-Path -Path $DotnetInstallDir -ChildPath "metadata\workloads\$DotnetVersionBand\InstalledWorkloads\tizen") -Force | Out-Null
+        if (Test-Path $(Join-Path -Path $DotnetInstallDir -ChildPath "metadata\workloads\$DotnetVersionBand\InstallerType\msi")) {
+            New-Item -Path "HKLM:\SOFTWARE\Microsoft\dotnet\InstalledWorkloads\Standalone\x64\$DotnetTargetVersionBand\tizen" -Force | Out-Null
+        }
+        $TxCommitted = $true
     }
-
-    # Clean up
-    Remove-Item -Path $TempDir -Force -Recurse
+    finally {
+        if (-not $TxCommitted) {
+            Write-Host "Install failed; rolling back the Tizen manifest."
+            if (Test-Path $TizenManifestDir) {
+                Remove-Item -Path $TizenManifestDir -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            if ($TxBackupDir -and (Test-Path $TxBackupDir)) {
+                Ensure-Directory $ManifestDir
+                Copy-Item -Path $TxBackupDir -Destination $TizenManifestDir -Recurse -Force
+            }
+        }
+        # Clean up
+        if (Test-Path $TempDir) { Remove-Item -Path $TempDir -Force -Recurse }
+    }
 
     Write-Host "Done installing Tizen workload $Version"
 }
