@@ -280,6 +280,19 @@ function Install-TizenWorkload([string]$DotnetVersion)
         $Version      = $ResolvedVersion
     }
 
+    # Unconditional gate, regardless of which branch above set $Version.
+    #
+    # An explicit -Version "" (or whitespace) does not equal "<latest>", so it skips the
+    # resolution block entirely and would otherwise reach the manifest REMOVAL below and a
+    # versionless NuGet URL - and the v2 package endpoint serves the LATEST package when the
+    # URL carries no version segment. Reject before any removal, URL construction or download.
+    if ([string]::IsNullOrWhiteSpace($Version)) {
+        throw "A manifest version is required. Pass -Version <VERSION>, or '<latest>' to resolve it automatically."
+    }
+    if ([string]::IsNullOrWhiteSpace($ManifestName)) {
+        throw "Could not determine the manifest package id for $DotnetVersion."
+    }
+
     # Check workload manifest directory.
     $ManifestDir = Join-Path -Path $DotnetInstallDir -ChildPath "sdk-manifests" | Join-Path -ChildPath $DotnetTargetVersionBand
     $TizenManifestDir = Join-Path -Path $ManifestDir -ChildPath "samsung.net.sdk.tizen"

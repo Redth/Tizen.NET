@@ -39,23 +39,32 @@ jobs:
 
     # Resolve the version to release.
     #
-    # Two properties matter here:
-    #  * A reference-only run (release_manifest=false) publishes no manifest, so it must be
-    #    completely NON-MUTATING - no bump, no commit, no tag.
-    #  * OLD == NEW is NOT necessarily an error. next-workload-version.py derives the next
-    #    version from what is published on NuGet, so if a previous run already bumped and
-    #    pushed but failed before publishing, the branch legitimately carries the intended
-    #    (still unpublished) version. That case must RESUME, not abort - otherwise a failed
-    #    release can never be retried.
+    # Publication is not atomic: the manifest, the remaining packs, the tag and the GitHub
+    # release are separate steps. If one fails partway, version V is PARTIALLY published -
+    # and because next-workload-version.py derives the next version from what exists on
+    # NuGet, it then answers V+1. Advancing at that point strands V forever with no tag,
+    # no release, and a missing pack set.
+    #
+    # So the state of V is determined FIRST, and V is resumed unless it is provably complete:
+    #   unpublished  -> resume V if the branch already carries it, else bump
+    #   partial      -> ALWAYS resume V (never advance)
+    #   published    -> resume only to finish a missing tag/release, otherwise bump
+    #
+    # A feed transport failure exits non-zero rather than being read as "unpublished".
     - name: Resolve release version
       id: bump
       working-directory: ./workload
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         set -euo pipefail
         OLD=$(grep -oP '(?<=<TizenWorkloadVersion>)[^<]+(?=</TizenWorkloadVersion>)' build/Versions.props)
-        NEW=$(python3 scripts/next-workload-version.py)
-        echo "Current: $OLD"
-        echo "Next:    $NEW"
+        echo "Current branch version: $OLD"
+
+        SDK="${{ github.event.inputs.net_sdk_version }}"
+        eval "$(sed -n '/# BEGIN VERSION BAND DETECTION/,/# END VERSION BAND DETECTION/p' scripts/workload-install.sh)"
+        BAND="$(compute_target_version_band "$SDK")"
+        echo "band=$BAND" >> "$GITHUB_OUTPUT"
 
         if [ "${{ github.event.inputs.release_manifest }}" != "true" ]; then
           echo "::notice ::Reference-only run: leaving TizenWorkloadVersion at $OLD (non-mutating)."
@@ -64,14 +73,43 @@ jobs:
           exit 0
         fi
 
-        if [ "$OLD" = "$NEW" ]; then
-          # The branch already holds the version NuGet does not have yet: resume it.
-          echo "::notice ::Resuming release of $OLD (already set on this branch, not yet published)."
+        # Publication state of the version the branch currently carries.
+        STATE_OUT="$(python3 scripts/release-state.py --version "$OLD" --band "$BAND")"
+        STATE="$(echo "$STATE_OUT" | sed -n 's/^state=//p')"
+        MISSING="$(echo "$STATE_OUT" | sed -n 's/^missing=//p')"
+        echo "State of $OLD: $STATE (missing: ${MISSING:-none})"
+        echo "resume_missing=$MISSING" >> "$GITHUB_OUTPUT"
+
+        # Has V already been tagged and released?
+        if gh release view "v$OLD" >/dev/null 2>&1; then RELEASED=true; else RELEASED=false; fi
+        echo "Release v$OLD exists: $RELEASED"
+
+        if [ "$STATE" = "partial" ]; then
+          echo "::warning ::Version $OLD is partially published (missing: $MISSING). Resuming it instead of advancing."
           echo "workload_version=$OLD" >> "$GITHUB_OUTPUT"
           echo "mutated=false" >> "$GITHUB_OUTPUT"
           exit 0
         fi
 
+        if [ "$STATE" = "published" ] && [ "$RELEASED" != "true" ]; then
+          echo "::warning ::Version $OLD is fully published but has no release tag. Resuming to complete the tag/release."
+          echo "workload_version=$OLD" >> "$GITHUB_OUTPUT"
+          echo "mutated=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        NEW=$(python3 scripts/next-workload-version.py)
+        echo "Next: $NEW"
+
+        if [ "$STATE" = "unpublished" ] && [ "$OLD" = "$NEW" ]; then
+          # The branch already carries an unpublished version: resume it.
+          echo "::notice ::Resuming release of $OLD (set on this branch, nothing published yet)."
+          echo "workload_version=$OLD" >> "$GITHUB_OUTPUT"
+          echo "mutated=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # V is complete (published AND released): it is safe to advance.
         python3 scripts/next-workload-version.py --apply --verbose
         echo "workload_version=$NEW" >> "$GITHUB_OUTPUT"
         echo "mutated=true" >> "$GITHUB_OUTPUT"
@@ -155,30 +193,59 @@ jobs:
         git push origin "HEAD:${BRANCH}"
         echo "release_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-    - name: Push Manifest/SDK/Runtime packs
+    # Publish every versioned pack. `--skip-duplicate` makes each push idempotent: NuGet
+    # packages are immutable, so an id+version that already exists IS the intended artifact
+    # and is simply skipped. That is what allows a partially published version to be resumed
+    # by re-running with the same version.
+    #
+    # The pushes are ordered so the MANIFEST GOES LAST. The manifest is what
+    # next-workload-version.py keys off, so publishing it only after its companion packs
+    # means an interruption cannot leave a version that looks advanceable while its packs are
+    # missing. Combined with the resume detection above, an interrupted release re-runs
+    # cleanly from any point.
+    - name: Push SDK/Runtime/Templates packs
       if: ${{ github.event.inputs.release_manifest == 'true' }}
       run: |
-        echo "Pushing Manifest packs for version ${{ github.event.inputs.net_sdk_version }}"...
+        set -euo pipefail
+        VER="${{ steps.bump.outputs.workload_version }}"
+        echo "Publishing companion packs for workload version $VER..."
+        for pattern in Samsung.Tizen.Sdk Samsung.NETCore.App.Runtime Samsung.Tizen.Templates; do
+          dotnet nuget push ${{ steps.stage.outputs.staging }}/$pattern.*.nupkg \
+                        -k ${{ secrets.NUGET_APIKEY }} \
+                        -s https://api.nuget.org/v3/index.json \
+                        -t 3000 \
+                        --skip-duplicate
+        done
+
+    - name: Push Manifest pack
+      if: ${{ github.event.inputs.release_manifest == 'true' }}
+      run: |
+        set -euo pipefail
+        echo "Publishing manifest for band ${{ steps.bump.outputs.band }}..."
         dotnet nuget push ${{ steps.stage.outputs.staging }}/Samsung.NET.Sdk.Tizen.Manifest-*.nupkg \
                       -k ${{ secrets.NUGET_APIKEY }} \
                       -s https://api.nuget.org/v3/index.json \
                       -t 3000 \
                       --skip-duplicate
-        dotnet nuget push ${{ steps.stage.outputs.staging }}/Samsung.Tizen.Sdk.*.nupkg \
-                      -k ${{ secrets.NUGET_APIKEY }} \
-                      -s https://api.nuget.org/v3/index.json \
-                      -t 3000 \
-                      --skip-duplicate
-        dotnet nuget push ${{ steps.stage.outputs.staging }}/Samsung.NETCore.App.Runtime.*.nupkg \
-                      -k ${{ secrets.NUGET_APIKEY }} \
-                      -s https://api.nuget.org/v3/index.json \
-                      -t 3000 \
-                      --skip-duplicate
-        dotnet nuget push ${{ steps.stage.outputs.staging }}/Samsung.Tizen.Templates.*.nupkg \
-                      -k ${{ secrets.NUGET_APIKEY }} \
-                      -s https://api.nuget.org/v3/index.json \
-                      -t 3000 \
-                      --skip-duplicate
+
+    # Confirm the full expected set is actually on the feed before tagging, so a release is
+    # never created for an incomplete publication.
+    - name: Verify publication is complete
+      if: ${{ github.event.inputs.release_manifest == 'true' }}
+      working-directory: ./workload
+      run: |
+        set -euo pipefail
+        VER="${{ steps.bump.outputs.workload_version }}"
+        BAND="${{ steps.bump.outputs.band }}"
+        for attempt in 1 2 3 4 5; do
+          OUT="$(python3 scripts/release-state.py --version "$VER" --band "$BAND")"
+          STATE="$(echo "$OUT" | sed -n 's/^state=//p')"
+          [ "$STATE" = "published" ] && { echo "All expected packages present for $VER."; exit 0; }
+          echo "Attempt $attempt: state=$STATE ($(echo "$OUT" | sed -n 's/^missing=//p')); feed may lag, retrying..."
+          sleep 30
+        done
+        echo "::error::Publication incomplete for $VER; not tagging. Re-run this workflow to resume."
+        exit 1
 
     - name: Push Ref pack
       if: ${{ github.event.inputs.release_reference == 'true' }}

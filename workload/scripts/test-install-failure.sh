@@ -411,6 +411,54 @@ PSEOF
     done
 fi
 
+# --- 11. explicit -Version "" must have no side effects ------------------------
+#
+# An explicit empty/whitespace -Version does NOT equal "<latest>", so it bypassed the
+# resolution-and-validation block entirely, reached the manifest REMOVAL, and produced a
+# versionless NuGet URL - and the v2 package endpoint serves the LATEST package for such a
+# URL. The gate is now unconditional, before any removal, URL construction or download.
+
+if command -v pwsh >/dev/null 2>&1 && [[ -f "$PS1_SCRIPT" ]]; then
+    echo ""
+    echo "-- explicit empty -Version has no side effects --"
+
+    EVDIR="$TMPROOT/emptyver"
+    mkdir -p "$EVDIR"
+    cat > "$EVDIR/dotnet" <<'STUB'
+#!/bin/bash
+case "$1" in
+    --version)   echo "10.0.100" ;;
+    --list-sdks) echo "10.0.100 [$(dirname "$0")/sdk]" ;;
+    *)           echo "SIDE_EFFECT: dotnet $*" ;;
+esac
+STUB
+    chmod +x "$EVDIR/dotnet"
+
+    for arg in "" "   "; do
+        # Pre-seed an installed manifest so its removal would be detectable.
+        seeded="$EVDIR/sdk-manifests/10.0.100/samsung.net.sdk.tizen"
+        rm -rf "$EVDIR/sdk-manifests"; mkdir -p "$seeded"
+        echo '{"version":"SENTINEL","packs":{}}' > "$seeded/WorkloadManifest.json"
+
+        ev_out="$(pwsh -NoProfile -File "$PS1_SCRIPT" -d "$EVDIR" -Version "$arg" 2>&1)"; ev_rc=$?
+        label="$([[ -z "$arg" ]] && echo 'empty' || echo 'whitespace')"
+
+        if [[ $ev_rc -ne 0 ]] \
+           && grep -q "manifest version is required" <<< "$ev_out" \
+           && ! grep -q "SIDE_EFFECT" <<< "$ev_out" \
+           && grep -q "SENTINEL" "$seeded/WorkloadManifest.json"; then
+            printf "  %sPASS%s  -Version %-12s rejected; no download, no removal\n" "$c_green" "$c_reset" "'$arg'"
+            pass=$((pass + 1))
+        else
+            printf "  %sFAIL%s  -Version %-12s exit=%s (expected rejection with no side effects)\n" "$c_red" "$c_reset" "'$arg'" "$ev_rc"
+            grep -q "SENTINEL" "$seeded/WorkloadManifest.json" 2>/dev/null || echo "        | installed manifest was REMOVED"
+            grep -q "SIDE_EFFECT" <<< "$ev_out" && echo "        | dotnet was invoked"
+            echo "$ev_out" | tail -3 | sed 's/^/        | /'
+            fail=$((fail + 1))
+        fi
+    done
+fi
+
 echo ""
 echo "============= install-failure summary ============="
 echo "  passed: $pass"

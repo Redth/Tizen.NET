@@ -75,7 +75,7 @@ eventual `11.0.100` GA need no further code change. This is asserted by
 | `test-version-band` | SDK version → feature band across **both installers and Config.mk**, fallback band family, band isolation |
 | `test-template-conditions` | template platform detection across TFMs |
 | `test-package-fallback` | fallback filtering, plus selection priority / atomicity in both directory-creation orders |
-| `test-release-workflow` | release ordering, retryability, non-mutating reference-only runs |
+| `test-release-workflow` | release ordering, retryability, partial-publication resume, failure injection |
 | `test-install-failure` | installer exit codes, fallback package **id**, SDK-pin verification, empty/transport responses |
 | `Generate-InstallScripts.ps1 -Check` | version-map drift **and** install-script integrity |
 
@@ -121,6 +121,12 @@ Two properties are load-bearing:
   next SDK's install. Both are fixed and pinned by `scripts/test-install-failure.sh`.
 
 An 11.x request with no 11.x map entry fails closed.
+
+A manifest version is required unconditionally, whichever branch produced it. An explicit
+`-Version ""` (or whitespace) does not equal `"<latest>"`, so it used to bypass resolution and
+validation entirely, remove the installed manifest, and construct a **versionless** NuGet URL —
+and the v2 package endpoint serves the **latest** package for such a URL. The gate now runs
+before any removal, URL construction or download.
 
 The resolved version is validated before use. An empty or all-blank `versions[]` from the feed
 is rejected rather than returned as a truthy `"<id>="`: the NuGet v2 package endpoint serves the
@@ -319,4 +325,36 @@ on NuGet, so when the branch already carries the intended still-unpublished vers
 A reference-only run (`release_manifest=false`) publishes no manifest and is completely
 non-mutating: no bump, no commit, no tag.
 
-`scripts/test-release-workflow.sh` pins all of the above.
+### Resuming a partially published release
+
+Publication is not atomic: the companion packs, the manifest, the tag and the GitHub release
+are separate steps. If one fails partway, version V is *partially* published — and because
+`next-workload-version.py` derives the next version from what exists on NuGet, it then answers
+V+1. Advancing at that point strands V permanently with no tag, no release and a missing pack
+set.
+
+`scripts/release-state.py` makes that state explicit (`unpublished` / `partial` / `published`),
+and the workflow resumes V unless it is provably complete:
+
+| State of the branch's version | Action |
+|---|---|
+| `partial` | **always resume V** — never advance |
+| `published` but no tag/release | resume V to finish the tag/release |
+| `unpublished` and branch already carries it | resume V |
+| `published` **and** released | safe to compute V+1 |
+
+Two supporting properties:
+
+* **The manifest is published last.** It is what `next-workload-version.py` keys off, so
+  publishing it only after its companion packs means an interruption cannot leave a version
+  that looks advanceable while its packs are missing.
+* **Every push is idempotent** (`--skip-duplicate`). NuGet packages are immutable, so an
+  id+version that already exists *is* the intended artifact and is skipped; only missing
+  artifacts are published. Completeness is re-verified (with retries for feed lag) before the
+  tag is created, and re-creating an existing tag is a no-op.
+
+A feed transport failure exits non-zero rather than being read as `unpublished` — otherwise a
+network blip would advance the version and strand the release it was meant to protect.
+
+`scripts/test-release-workflow.sh` pins all of the above, including failure injection at each
+publication step.
