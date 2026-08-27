@@ -28,6 +28,23 @@ Copyright (c) Samsung All rights reserved.
     />
   </ItemGroup>
 
+  <!--
+    Samsung.NETCore.App.Runtime.tizen is a placeholder runtime pack: it ships no runtime
+    binaries, because Tizen applications run against the runtime provided by the device
+    platform. A self-contained publish therefore cannot produce a working application - it
+    would emit an app with no runtime alongside it.
+
+    Fail with an actionable error instead of letting the build proceed. Set
+    SkipTizenSelfContainedCheck=true to bypass this if you are supplying a runtime by
+    other means.
+  -->
+  <Target Name="_TizenErrorOnSelfContained"
+          BeforeTargets="ProcessFrameworkReferences;ResolveRuntimePackAssets"
+          Condition=" '$(TargetPlatformIdentifier)' == 'tizen' And '$(SelfContained)' == 'true' And '$(SkipTizenSelfContainedCheck)' != 'true' ">
+    <Error Code="TIZENSDK001"
+           Text="Self-contained publishing is not supported for Tizen. Samsung.NETCore.App.Runtime.tizen is a placeholder runtime pack that contains no runtime binaries; Tizen applications run against the runtime provided by the device platform. Remove SelfContained=true (or set PublishSelfContained=false) and publish framework-dependent." />
+  </Target>
+
   <ItemGroup>
     <FrameworkReference Update="Microsoft.NETCore.App" RuntimePackLabels="Tizen" />
     <KnownRuntimePack Remove="Microsoft.NETCore.App" />

@@ -74,7 +74,8 @@ eventual `11.0.100` GA need no further code change. This is asserted by
 | `test-matrix-self-test` | matrix row selection (an over-strict check silently builds nothing) |
 | `test-version-band` | SDK version → feature band across **both installers and Config.mk**, fallback band family, band isolation |
 | `test-template-conditions` | template platform detection across TFMs |
-| `test-install-failure` | installers exit non-zero on failure |
+| `test-package-fallback` | `PackageTargetFallback` compatibility filtering, incl. negative cross-platform/version cases |
+| `test-install-failure` | installers exit non-zero on failure; fallback resolves package **id**, no cross-SDK leakage |
 | `Generate-InstallScripts.ps1 -Check` | version-map drift **and** install-script integrity |
 
 `make check` requires `pwsh` for the last row. If it is unavailable the target fails with an
@@ -99,23 +100,53 @@ consequences worth knowing:
 Pass `DOTNET_VERSION` via the environment or omit it. An explicit empty command-line override
 (`make DOTNET_VERSION=`) beats the resolved value and yields an empty band.
 
-## Package asset resolution
-
-`PackageTargetFallback` in `Samsung.Tizen.Sdk.NuGet.targets` lists the package `lib/<tfm>/`
-folder names that `FixupNuGetReferences` prefers over a package's `netstandard2.x` assets. A
-combination missing from that list means a package shipping both `lib/netstandard2.0/` and
-`lib/<tfm>/` silently resolves to the **netstandard** assembly. It now covers the full
-(.NET major × Tizen platform) cross-product — including `net11.0-tizen11.0` — and check C8
-keeps it in sync with `KnownRuntimePack` × `TizenSdkSupportedTargetPlatformVersion`.
-
 ## Manifest fallback safety
 
 When a band's manifest is not published, the installers fall back to the cached version map.
-That fallback is now constrained to the **same .NET major.minor family**. The PowerShell
-installer previously took a fixed-length prefix (`$ManifestBaseName.Length + 2`), so
-`...Manifest-11.0.100-preview.7` was truncated to `...Manifest-1`, matched the 10.x entries and
-installed a **.NET 10 manifest into an 11.x band**. An 11.x request with no 11.x map entry now
-fails closed.
+Two properties are load-bearing:
+
+- **The resolved package ID travels with the version.** `getLatestVersion` /
+  `Get-LatestVersion` return `"<packageId>=<version>"`. Returning only a version made the
+  caller download that version under the *originally requested* — and unpublished — id: a
+  request for `...manifest-10.0.400` resolves to version `10.0.127`, which exists only under
+  `...manifest-10.0.300`, so the download 404'd. The manifest is still installed into the
+  **requested** band's directory; only the package fetched differs.
+- **The fallback is constrained to the same .NET major.minor family**, and the resolved id is
+  function-local. The PowerShell installer previously took a fixed-length prefix
+  (`$ManifestBaseName.Length + 2`), so `...Manifest-11.0.100-preview.7` was truncated to
+  `...Manifest-1`, matched the 10.x entries and installed a **.NET 10 manifest into an 11.x
+  band**. It also cached the resolved id in a script-level `$global:FallbackId` that was never
+  cleared, so an `-UpdateAllWorkloads` run could carry one SDK's fallback package into the
+  next SDK's install. Both are fixed and pinned by `scripts/test-install-failure.sh`.
+
+An 11.x request with no 11.x map entry fails closed.
+
+Note the installer must run under **bash 3.2** (macOS ships it and is a supported target, see
+`DOTNET_DEFAULT_PATH_MACOS`). The `${var,,}` lowercase expansion is bash 4+ and raised
+`bad substitution` there, leaving the version empty and silently skipping the fallback
+entirely; a portable `tr` is used instead, and an empty lookup response now takes the same
+fallback path as an explicit `BlobNotFound`.
+
+## Package asset resolution
+
+`PackageTargetFallback` in `Samsung.Tizen.Sdk.NuGet.targets` lists the package `lib/<tfm>/`
+folder names that `FixupNuGetReferences` prefers over a package's `netstandard2.x` assets.
+
+The task matches those directories **by name only** and performs no compatibility check of its
+own, so the list must be filtered to what the project can actually consume. An unfiltered
+cross-product lets a `net6.0-tizen8.0` build pick up `net6.0-tizen11.0` (newer platform) or
+`net11.0-tizen8.0` (newer .NET) assets. A candidate is emitted only when its .NET version and
+its Tizen platform version are both `<=` the project's, and candidates are appended
+highest-first so the best compatible match wins the task's first-wins selection.
+
+The filter is built from conditional **properties**, not filtered items: MSBuild evaluates all
+top-level properties before any items, so a property referencing `@(item)` at that level
+silently expands to nothing.
+
+Check C8 verifies the candidate list covers the full (.NET major × platform) cross-product
+*and* that every candidate carries a compatibility condition;
+`scripts/test-package-fallback.sh` pins the filtering itself with negative
+cross-platform/cross-version assertions.
 
 ## What changed in this repository
 
@@ -132,8 +163,10 @@ fails closed.
 | `scripts/test-version-band.sh` | new — asserts SDK-version → feature-band mapping for both installers |
 | `scripts/test-template-conditions.sh` | new — pins template platform detection across TFMs |
 | `scripts/test-install-failure.sh` | new — pins installer exit codes |
+| `scripts/test-package-fallback.sh` | new — pins `PackageTargetFallback` compatibility filtering |
 | `.github/workflows/build-matrix.yml` | .NET 11 leg, advisory off a `net11.0` branch and blocking on one |
 | `.github/workflows/build-workload.yml` | builds against `$(DotNet11SdkVersion)` on a `net11.0` branch |
+| `.github/workflows/release-workload.yml` | notes reuse the staging step's verified band / manifest id |
 
 ### Template platform detection
 
@@ -208,22 +241,39 @@ Observations from porting a real consumer (`Samsung/Tizen.UIExtensions`) onto th
   push target in `build-workload.yml`'s deploy job. Any documentation or template still pointing
   consumers at it for *restore* is dead; worth confirming whether the push target is still wanted.
 
-## `RuntimeList.xml` is not XML-parsed (investigated)
+## `RuntimeList.xml` and self-contained publishing
 
-`src/Samsung.NETCore.App.Runtime/data/RuntimeList.xml` contains one `<FileList .../>` element per
-supported .NET version and therefore has multiple root elements, i.e. it is **not well-formed
-XML**. This is pre-existing and deliberate-by-accident: `Samsung.NETCore.App.Runtime.tizen` is a
-placeholder runtime pack (its only payload is `lib/net6.0-tizen/_._`), and the file is never
-parsed.
+`src/Samsung.NETCore.App.Runtime/data/RuntimeList.xml` previously contained one
+`<FileList .../>` element per supported .NET version, i.e. **multiple root elements**, which
+is not well-formed XML.
 
-Verified against the .NET 11 SDK by replacing the installed pack's `RuntimeList.xml` with the
-literal text `<<< THIS IS NOT XML AT ALL &&& >>>` and rebuilding a `net11.0-tizen11.0` project
-**with an explicit `RuntimeIdentifier=tizen-x86`** — the path that resolves runtime pack assets,
-and the one .NET MAUI takes via `EnableImplicitRuntimeIdentifiers`. The build succeeded with
-0 errors.
+**This file is parsed.** `Microsoft.NET.Build.Tasks` contains the literal `RuntimeList.xml`
+alongside the runtime-pack manifest fields it reads (`Managed`, `Native`, `PgoData`,
+`Resources`, `AssemblyVersion`, `FileVersion`, `PublicKeyToken`), i.e.
+`ResolveRuntimePackAssets` reads it whenever runtime pack assets are resolved — notably for
+`SelfContained=true`. An earlier note in this file claimed it was never parsed; that claim was
+based on a framework-dependent RID build, which does not reach that task. **It was wrong and is
+retracted.**
 
-It is therefore left as-is: making it well-formed would require either a non-standard wrapper
-root or splitting the pack per .NET version, both of which carry more risk than the malformed
-file does while nothing reads it. Check C6 parses it with a line-oriented regex rather than an
-XML parser, matching how the file is actually produced and consumed. If a future SDK starts
-reading it, C6 and this note are the places to revisit.
+Both remediations are applied:
+
+1. **The file is now well-formed** — a single `<FileList>` root. The pack is a placeholder that
+   ships no runtime binaries (its only payload is `lib/net6.0-tizen/_._`), so the list is
+   legitimately empty.
+2. **Self-contained Tizen publishing is rejected up front** with `TIZENSDK001`, explaining that
+   Tizen applications run against the platform-provided runtime. Without it, the build failed
+   with the opaque `NETSDK1083: The specified RuntimeIdentifier 'tizen' is not recognized`.
+
+Verified on `11.0.100-preview.7.26381.103`: `dotnet build -p:SelfContained=true` on a
+`net11.0-tizen11.0` project now fails with `TIZENSDK001` and the actionable message.
+`SkipTizenSelfContainedCheck=true` bypasses the guard for anyone supplying a runtime by other
+means.
+
+**Scope note, stated precisely:** with the guard bypassed *and* the old malformed file restored,
+this configuration failed at `NETSDK1083` (RID resolution) *before* reaching
+`ResolveRuntimePackAssets`, so a raw `XmlException` could not be reproduced on this SDK. The
+malformed file was nevertheless a latent hazard on any path that does reach that task, and both
+fixes are correct regardless of which error surfaces first.
+
+Check C6 now parses the file with a real XML parser and asserts the `TIZENSDK001` guard exists;
+`test-matrix.sh` additionally asserts the runtime disposition end to end.

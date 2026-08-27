@@ -159,12 +159,16 @@ test-matrix-self-test:
 test-template-conditions:
 	@bash $(TOP)/scripts/test-template-conditions.sh
 
+.PHONY: test-package-fallback
+test-package-fallback:
+	@bash $(TOP)/scripts/test-package-fallback.sh
+
 .PHONY: test-install-failure
 test-install-failure:
 	@bash $(TOP)/scripts/test-install-failure.sh
 
 .PHONY: check
-check: validate-metadata test-matrix-self-test test-version-band test-template-conditions test-install-failure
+check: validate-metadata test-matrix-self-test test-version-band test-template-conditions test-package-fallback test-install-failure
 	@if command -v pwsh >/dev/null 2>&1; then \
 		pwsh $(TOP)/scripts/Generate-InstallScripts.ps1 -Check; \
 	else \

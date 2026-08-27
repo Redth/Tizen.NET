@@ -30,12 +30,17 @@ Checks:
       matching KnownRuntimePack in Samsung.Tizen.Sdk.targets. Without it the SDK
       cannot resolve Samsung.NETCore.App.Runtime.tizen and the build fails with
       NETSDK1082 ("no runtime pack available").
-  C6  Every KnownRuntimePack .NET major has a FileList row in RuntimeList.xml.
+  C6  RuntimeList.xml is well-formed XML with a single <FileList> root. It is parsed by
+      ResolveRuntimePackAssets (e.g. for SelfContained=true), so multiple roots throw a
+      raw XmlException. The pack ships no runtime binaries, so the list is empty and
+      self-contained publishing is rejected by TIZENSDK001 instead.
   C7  DotNet11SdkVersion exists in Versions.props and no workflow hardcodes a
       different .NET 11 SDK version (the workflows must grep the SSOT).
-  C8  PackageTargetFallback covers every (.NET major from KnownRuntimePack) x
-      (platform from TizenSdkSupportedTargetPlatformVersion) combination. A missing
-      entry silently downgrades a package to its netstandard2.x assets.
+  C8  The PackageTargetFallback candidate list covers every (.NET major from
+      KnownRuntimePack) x (platform from TizenSdkSupportedTargetPlatformVersion)
+      combination, and every candidate is emitted with a compatibility Condition.
+      A missing entry silently downgrades a package to its netstandard2.x assets;
+      an unconditional entry lets an incompatible TFM's assets be substituted.
 
 Run from anywhere — paths derive from this script's location.
 
@@ -46,6 +51,7 @@ Exit codes:
 from __future__ import annotations
 import re
 import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 WORKLOAD_DIR = Path(__file__).resolve().parents[1]
@@ -208,18 +214,33 @@ def main() -> int:
            ") all have a KnownRuntimePack")
 
     # --- C6 ---
-    runtime_list_vers = {
-        "net" + v for v in re.findall(r'TargetFrameworkVersion="([\d.]+)"', runtime_list)
-    }
-    missing_rl = sorted(krp_tfms - runtime_list_vers, key=lambda v: float(v[3:])) if krp_tfms else []
-    if not runtime_list_vers:
-        err("C6: no FileList rows parsed from Samsung.NETCore.App.Runtime/data/RuntimeList.xml")
-    elif missing_rl:
-        err("C6: RuntimeList.xml has no FileList row for " + str(missing_rl) +
-            " but a KnownRuntimePack declares it.")
-    else:
-        ok("C6: KnownRuntimePack majors (" + str(len(krp_tfms)) +
-           ") all present in RuntimeList.xml")
+    rl_path = WORKLOAD_DIR / "src/Samsung.NETCore.App.Runtime/data/RuntimeList.xml"
+    c6_ok = True
+    try:
+        rl_root = ET.parse(rl_path).getroot()
+    except ET.ParseError as exc:
+        err("C6: RuntimeList.xml is not well-formed XML (" + str(exc) + "). "
+            "ResolveRuntimePackAssets parses this file - e.g. for SelfContained=true - and "
+            "multiple roots surface as a raw XmlException.")
+        rl_root = None
+        c6_ok = False
+    if rl_root is not None:
+        if rl_root.tag != "FileList":
+            err("C6: RuntimeList.xml root is <" + rl_root.tag + ">, expected <FileList>")
+            c6_ok = False
+        # The pack is a placeholder with no runtime binaries. If files ever appear here,
+        # the self-contained rejection below needs revisiting.
+        files = rl_root.findall("File")
+        sdk_targets_txt = read("src/Samsung.Tizen.Sdk/targets/Samsung.Tizen.Sdk.targets")
+        has_guard = "TIZENSDK001" in sdk_targets_txt
+        if not files and not has_guard:
+            err("C6: RuntimeList.xml lists no runtime files, but Samsung.Tizen.Sdk.targets has "
+                "no TIZENSDK001 self-contained guard. A self-contained publish would emit an "
+                "app with no runtime.")
+            c6_ok = False
+        if c6_ok:
+            ok("C6: RuntimeList.xml well-formed (single <FileList> root, " + str(len(files)) +
+               " file(s)); self-contained guarded by TIZENSDK001")
 
     # --- C7 ---
     net11_sdk = props.get("DotNet11SdkVersion", "")
@@ -230,9 +251,17 @@ def main() -> int:
         workflow_dir = WORKLOAD_DIR.parent / ".github" / "workflows"
         stray = []
         for wf in sorted(workflow_dir.glob("*.yml")):
-            text = wf.read_text(encoding="utf-8")
-            for literal in set(re.findall(r"\b11\.0\.\d{3}-[A-Za-z0-9.]+", text)):
-                if literal != net11_sdk:
+            # Strip comments: prose may legitimately mention a band or an example
+            # version. Only real values can cause CI to use the wrong SDK.
+            lines = []
+            for line in wf.read_text(encoding="utf-8").splitlines():
+                stripped = line.lstrip()
+                if stripped.startswith("#"):
+                    continue
+                lines.append(line.split(" #", 1)[0])
+            text = "\n".join(lines)
+            for literal in set(re.findall(r"\b11\.0\.\d{3}-[A-Za-z0-9]+(?:\.[A-Za-z0-9]+)*", text)):
+                if literal.rstrip(".") != net11_sdk:
                     stray.append(wf.name + ": " + literal)
         if stray:
             err("C7: workflow(s) hardcode a .NET 11 SDK version differing from "
@@ -242,25 +271,36 @@ def main() -> int:
 
     # --- C8 ---
     nuget_targets = read("src/Samsung.Tizen.Sdk/targets/Samsung.Tizen.Sdk.NuGet.targets")
-    ptf_match = re.search(r"<PackageTargetFallback>(.*?)</PackageTargetFallback>",
-                          nuget_targets, re.S)
-    if not ptf_match:
-        err("C8: PackageTargetFallback not found in Samsung.Tizen.Sdk.NuGet.targets")
+    # Each candidate is a conditional _TizenFallbackList append. Capture the appended TFM
+    # and whether the line carries a compatibility Condition.
+    cand_lines = re.findall(
+        r'<_TizenFallbackList(\s+Condition="[^"]*")?>\$\(_TizenFallbackList\);([^<]+)</_TizenFallbackList>',
+        nuget_targets)
+    if not cand_lines:
+        err("C8: no _TizenFallbackList candidates found in Samsung.Tizen.Sdk.NuGet.targets")
     elif not krp_tfms or not supported_set:
         err("C8: cannot evaluate - KnownRuntimePack or supported platform list empty")
     else:
-        listed = set(
-            e.strip() for e in ptf_match.group(1).replace("\n", "").split(";") if e.strip()
-        )
+        listed = {tfm.strip() for _cond, tfm in cand_lines}
+        unconditional = sorted(tfm.strip() for cond, tfm in cand_lines if not cond)
         expected = {m + "-tizen" + p for m in krp_tfms for p in supported_set}
         missing_ptf = sorted(expected - listed)
+        c8_ok = True
         if missing_ptf:
             err("C8: PackageTargetFallback missing " + str(missing_ptf) +
                 ". A package shipping lib/<tfm>/ alongside netstandard2.x would silently "
                 "resolve to the netstandard assets for those TFMs.")
-        else:
+            c8_ok = False
+        if unconditional:
+            err("C8: PackageTargetFallback candidate(s) " + str(unconditional) +
+                " have no compatibility Condition. FixupNuGetReferences matches by name "
+                "only, so an unconditional entry lets an incompatible TFM's assets be "
+                "substituted (e.g. net6.0-tizen11.0 into a net6.0-tizen8.0 build).")
+            c8_ok = False
+        if c8_ok:
             ok("C8: PackageTargetFallback covers all " + str(len(expected)) +
-               " supported (.NET major x platform) combinations")
+               " supported (.NET major x platform) combinations; all " +
+               str(len(cand_lines)) + " candidates are compatibility-gated")
 
     print()
     if errors:

@@ -54,6 +54,26 @@ jobs:
         echo "workload_version=$NEW" >> "$GITHUB_OUTPUT"
         echo "::notice ::Bumped TizenWorkloadVersion: $OLD -> $NEW"
 
+    # Persist the bump. Without this the tag created below points at a commit whose
+    # Versions.props still holds the PREVIOUS version, so the released sources do not
+    # correspond to the published package versions.
+    - name: Commit and push the version bump
+      run: |
+        set -e
+        BRANCH="${GITHUB_REF_NAME}"
+        VER="${{ steps.bump.outputs.workload_version }}"
+        if git diff --quiet -- workload/build/Versions.props; then
+          echo "::error::Versions.props was not modified by the bump step."
+          exit 1
+        fi
+        git config user.name  "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git add workload/build/Versions.props
+        git commit -m "chore: bump TizenWorkloadVersion to ${VER}"
+        git push origin "HEAD:${BRANCH}"
+        echo "release_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      id: commit
+
     - name: Install Wix toolset
       run: sudo apt-get install -y wixl
 
@@ -97,7 +117,11 @@ jobs:
           ls -1 "$STAGING"
           exit 1
         fi
+        MANIFEST_PKG="$(basename "$(ls "$STAGING/Samsung.NET.Sdk.Tizen.Manifest-$BAND."*.nupkg | head -1)")"
         echo "staging=$STAGING" >> "$GITHUB_OUTPUT"
+        echo "band=$BAND" >> "$GITHUB_OUTPUT"
+        echo "manifest_id=Samsung.NET.Sdk.Tizen.Manifest-$BAND" >> "$GITHUB_OUTPUT"
+        echo "manifest_pkg=$MANIFEST_PKG" >> "$GITHUB_OUTPUT"
         echo "Staged packages:"; ls -1 "$STAGING"
 
     - name: Push Manifest/SDK/Runtime packs
@@ -142,14 +166,19 @@ jobs:
       run: |
         VER="${{ steps.bump.outputs.workload_version }}"
         SDK="${{ github.event.inputs.net_sdk_version }}"
-        BAND="${SDK%%-*}"
+        # Canonical feature band and manifest id, as resolved and VERIFIED against the
+        # staged artifacts. Do not recompute here: '${SDK%%-*}' yields '11.0.100' for
+        # 11.0.100-preview.7.* and '10.0.404' for a servicing band, linking to packages
+        # that were never published.
+        BAND="${{ steps.stage.outputs.band }}"
+        MANIFEST_ID="${{ steps.stage.outputs.manifest_id }}"
         MAJOR_MINOR="$(echo "$BAND" | cut -d. -f1-2)"
         {
           echo "### Target .NET SDK: .NET ${SDK}"
           echo ""
           echo "## NuGet Packages"
           echo ""
-          echo "- https://www.nuget.org/packages/Samsung.NET.Sdk.Tizen.Manifest-${BAND}/${VER}"
+          echo "- https://www.nuget.org/packages/${MANIFEST_ID}/${VER}"
           echo "- https://www.nuget.org/packages/Samsung.NETCore.App.Runtime.tizen/${VER}"
           echo "- https://www.nuget.org/packages/Samsung.Tizen.Sdk/${VER}"
           echo "- https://www.nuget.org/packages/Samsung.Tizen.Templates/${VER}"
@@ -159,7 +188,7 @@ jobs:
           done
         } > "$RUNNER_TEMP/release-notes.md"
         gh release create "v${VER}" \
-          --target "${GITHUB_REF_NAME}" \
+          --target "${{ steps.commit.outputs.release_sha }}" \
           --title "Tizen Workload ${VER} - .Net ${MAJOR_MINOR}" \
           --notes-file "$RUNNER_TEMP/release-notes.md" \
           --generate-notes

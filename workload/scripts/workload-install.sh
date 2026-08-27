@@ -63,7 +63,7 @@ while [ $# -ne 0 ]; do
             ;;
         -d|--dotnet-install-dir)
             shift
-            DOTNET_INSTALL_DIR=$1
+            DOTNET_INSTALL_DIR="$1"
             ;;
         -t|--dotnet-target-version-band)
             shift
@@ -95,7 +95,7 @@ while [ $# -ne 0 ]; do
 done
 
 function read_dotnet_link() {
-    cd -P "$(dirname "$1")"
+    cd -P "$(dirname "$1")" || return 1
     dotnet_file="$PWD/$(basename "$1")"
     while [[ -h "$dotnet_file" ]]; do
         cd -P "$(dirname "$dotnet_file")"
@@ -112,33 +112,41 @@ function error_permission_denied() {
 }
 
 function ensure_directory() {
-    if [ ! -d $1 ]; then
-        mkdir -p $1 || error_permission_denied
+    if [ ! -d "$1" ]; then
+        mkdir -p "$1" || error_permission_denied
     fi
-    [ ! -w $1 ] && error_permission_denied
+    [ ! -w "$1" ] && error_permission_denied
 }
 
 # Check dotnet install directory.
 if [[ "$DOTNET_INSTALL_DIR" == "<auto>" ]]; then
     if [[ -n "$DOTNET_ROOT" && -d "$DOTNET_ROOT" ]]; then
-        DOTNET_INSTALL_DIR=$DOTNET_ROOT
+        DOTNET_INSTALL_DIR="$DOTNET_ROOT"
     elif [[ -d "$DOTNET_DEFAULT_PATH_LINUX" ]]; then
-        DOTNET_INSTALL_DIR=$DOTNET_DEFAULT_PATH_LINUX
+        DOTNET_INSTALL_DIR="$DOTNET_DEFAULT_PATH_LINUX"
     elif [[ -d "$DOTNET_DEFAULT_PATH_MACOS" ]]; then
-        DOTNET_INSTALL_DIR=$DOTNET_DEFAULT_PATH_MACOS
+        DOTNET_INSTALL_DIR="$DOTNET_DEFAULT_PATH_MACOS"
     elif [[ -n "$(which dotnet)" ]]; then
-        DOTNET_INSTALL_DIR=$(read_dotnet_link $(which dotnet))
+        DOTNET_INSTALL_DIR="$(read_dotnet_link "$(which dotnet)")"
     fi
 fi
-if [ ! -d $DOTNET_INSTALL_DIR ]; then
+if [ ! -d "$DOTNET_INSTALL_DIR" ]; then
     echo "No installed dotnet \`$DOTNET_INSTALL_DIR\`."
     exit 1
 fi
 
+# Resolve the manifest package to install for a requested manifest id.
+#
+# Echoes "<packageId>=<version>", or the empty string when nothing is available.
+# The package id MUST be returned alongside the version: when the requested band has
+# no published manifest we fall back to an EARLIER band's package, and downloading
+# that version under the originally requested (non-existent) id 404s. For example
+# a request for '...manifest-10.0.400' resolves to '...manifest-10.0.300=10.0.127'
+# and the 10.0.300 package is what has to be downloaded.
 function getLatestVersion () {
     for index in "${LatestVersionMap[@]}"; do
          if [ "${index%%=*}" = "${1}" ]; then
-             echo "${index#*=}"
+             echo "${1}=${index#*=}"
              return
          fi
     done
@@ -153,15 +161,21 @@ function getLatestVersion () {
         return
     fi
     local prefix="${manifestId%%-*}-${family}."
+    local fallbackId=""
     local fallbackVersion=""
     for entry in "${LatestVersionMap[@]}"; do
         mapKey="${entry%%=*}"
         mapValue="${entry#*=}"
         if [[ "$mapKey" == "$prefix"* ]]; then
+            fallbackId="$mapKey"
             fallbackVersion="$mapValue"
         fi
     done
-    echo "$fallbackVersion"
+    if [[ -z "$fallbackId" ]]; then
+        echo ""
+        return
+    fi
+    echo "$fallbackId=$fallbackVersion"
 }
 
 # Check installed dotnet version
@@ -220,11 +234,22 @@ function install_tizenworkload() {
 
     # Check latest version of manifest.
     if [[ "$MANIFEST_VERSION" == "<latest>" ]]; then
-        MANIFEST_VERSION=$(curl -s https://api.nuget.org/v3-flatcontainer/${MANIFEST_NAME,,}/index.json | grep \" | tail -n 1 | tr -d '\r' | xargs)
-        if [ -n "$MANIFEST_VERSION" ] && echo "$MANIFEST_VERSION" | grep -q "BlobNotFound"; then
-            MANIFEST_VERSION=$(getLatestVersion "$MANIFEST_NAME")
-            if [[ -n $MANIFEST_VERSION ]]; then
-                echo "Return cached latest version: $MANIFEST_VERSION"
+        # NOTE: use tr, not the ${var,,} expansion. That expansion is bash 4+, and macOS
+        # still ships bash 3.2 - where it raises "bad substitution", leaves
+        # MANIFEST_VERSION empty and silently skips the fallback below. macOS is a
+        # supported target (see DOTNET_DEFAULT_PATH_MACOS).
+        MANIFEST_NAME_LOWER=$(echo "$MANIFEST_NAME" | tr '[:upper:]' '[:lower:]')
+        MANIFEST_VERSION=$(curl -s https://api.nuget.org/v3-flatcontainer/$MANIFEST_NAME_LOWER/index.json | grep \" | tail -n 1 | tr -d '\r' | xargs)
+        # An empty response (network failure, or the package having never been published)
+        # must take the same fallback path as an explicit BlobNotFound.
+        if [ -z "$MANIFEST_VERSION" ] || echo "$MANIFEST_VERSION" | grep -q "BlobNotFound"; then
+            RESOLVED_MANIFEST=$(getLatestVersion "$MANIFEST_NAME")
+            if [[ -n $RESOLVED_MANIFEST ]]; then
+                # Download the package that actually exists. The manifest is still
+                # installed into the requested band's directory below.
+                MANIFEST_NAME="${RESOLVED_MANIFEST%%=*}"
+                MANIFEST_VERSION="${RESOLVED_MANIFEST#*=}"
+                echo "Return cached latest version: $MANIFEST_NAME/$MANIFEST_VERSION"
             else
                 echo "Failed to get the latest version of $MANIFEST_NAME."
                 return 1
@@ -233,29 +258,35 @@ function install_tizenworkload() {
     fi
 
     # Check workload manifest directory.
-    SDK_MANIFESTS_DIR=$DOTNET_INSTALL_DIR/sdk-manifests/$DOTNET_TARGET_VERSION_BAND
-    ensure_directory $SDK_MANIFESTS_DIR
+    SDK_MANIFESTS_DIR="$DOTNET_INSTALL_DIR/sdk-manifests/$DOTNET_TARGET_VERSION_BAND"
+    ensure_directory "$SDK_MANIFESTS_DIR"
 
     TMPDIR=$(mktemp -d)
 
     echo "Installing $MANIFEST_NAME/$MANIFEST_VERSION to $SDK_MANIFESTS_DIR..."
 
     # Download and extract the manifest nuget package.
-    curl -s -o $TMPDIR/manifest.zip -L https://www.nuget.org/api/v2/package/$MANIFEST_NAME/$MANIFEST_VERSION
-
-    unzip -qq -d $TMPDIR/unzipped $TMPDIR/manifest.zip
-    if [ ! -d $TMPDIR/unzipped/data ]; then
-        echo "No such files to install."
-        rm -fr $TMPDIR
+    curl -sfL -o "$TMPDIR/manifest.zip" "https://www.nuget.org/api/v2/package/$MANIFEST_NAME/$MANIFEST_VERSION"
+    CURL_STATUS=$?
+    if [ $CURL_STATUS -ne 0 ]; then
+        echo "Failed to download $MANIFEST_NAME/$MANIFEST_VERSION (curl exit $CURL_STATUS)."
+        rm -fr "$TMPDIR"
         return 1
     fi
-    chmod 744 $TMPDIR/unzipped/data/*
+
+    unzip -qq -d "$TMPDIR/unzipped" "$TMPDIR/manifest.zip"
+    if [ ! -d "$TMPDIR/unzipped/data" ]; then
+        echo "No such files to install."
+        rm -fr "$TMPDIR"
+        return 1
+    fi
+    chmod 744 "$TMPDIR"/unzipped/data/*
 
     # Copy manifest files to dotnet sdk.
-    mkdir -p $SDK_MANIFESTS_DIR/samsung.net.sdk.tizen
-    cp -f $TMPDIR/unzipped/data/* $SDK_MANIFESTS_DIR/samsung.net.sdk.tizen/
+    mkdir -p "$SDK_MANIFESTS_DIR/samsung.net.sdk.tizen"
+    cp -f "$TMPDIR"/unzipped/data/* "$SDK_MANIFESTS_DIR/samsung.net.sdk.tizen/"
 
-    if [ ! -f $SDK_MANIFESTS_DIR/samsung.net.sdk.tizen/WorkloadManifest.json ]; then
+    if [ ! -f "$SDK_MANIFESTS_DIR/samsung.net.sdk.tizen/WorkloadManifest.json" ]; then
         echo "Installation is failed."
         rm -fr $TMPDIR
         return 1
@@ -269,11 +300,11 @@ function install_tizenworkload() {
         CACHE_GLOBAL_JSON="false"
     fi
     dotnet new globaljson --sdk-version $DOTNET_VERSION
-    $DOTNET_INSTALL_DIR/dotnet workload install tizen --skip-manifest-update
+    "$DOTNET_INSTALL_DIR/dotnet" workload install tizen --skip-manifest-update
     local install_status=$?
 
     # Clean-up
-    rm -fr $TMPDIR
+    rm -fr "$TMPDIR"
     rm global.json
     if [[ "$CACHE_GLOBAL_JSON" == "true" ]]; then
         mv global.json.bak global.json
@@ -289,9 +320,9 @@ function install_tizenworkload() {
 }
 
 if [[ "$UPDATE_ALL_WORKLOADS" == "true" ]]; then
-    INSTALLED_DOTNET_SDKS=$($DOTNET_COMMAND --list-sdks | sed -E -n '/^([6-9]|[1-9][0-9]+)\./p' | sed 's/ \[.*//g')
+    INSTALLED_DOTNET_SDKS=$("$DOTNET_COMMAND" --list-sdks | sed -E -n '/^([6-9]|[1-9][0-9]+)\./p' | sed 's/ \[.*//g')
 else
-    INSTALLED_DOTNET_SDKS=$($DOTNET_COMMAND --version)
+    INSTALLED_DOTNET_SDKS=$("$DOTNET_COMMAND" --version)
 fi
 
 FAILED_SDKS=""

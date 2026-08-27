@@ -27,7 +27,6 @@ $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
 $ManifestBaseName = "Samsung.NET.Sdk.Tizen.Manifest"
-$global:FallbackId = ""
 
 # BEGIN AUTO-GENERATED VERSION MAP -- edit version-map.json and rerun Generate-InstallScripts.ps1
 $LatestVersionMap = [ordered]@{
@@ -96,7 +95,7 @@ function Get-LatestVersion([string]$Id) {
         try
         {
             $Response = Invoke-WebRequest -Uri https://api.nuget.org/v3-flatcontainer/$($Id.ToLowerInvariant())/index.json -UseBasicParsing | ConvertFrom-Json
-            return $Response.versions | Select-Object -Last 1
+            return "$Id=$($Response.versions | Select-Object -Last 1)"
         }
         catch {
             Write-Host "Id: $Id"
@@ -110,7 +109,7 @@ function Get-LatestVersion([string]$Id) {
     if ($LatestVersionMap.Contains($Id))
     {
         Write-Host "Return cached latest version."
-        return $LatestVersionMap.$Id
+        return "$Id=$($LatestVersionMap.$Id)"
     }
     else
     {
@@ -132,10 +131,10 @@ function Get-LatestVersion([string]$Id) {
             }
             if ($MatchingFallbackVersion)
             {
-                $global:FallbackId = $MatchingFallbackId[-1]
+                $FallbackId = $MatchingFallbackId[-1]
                 $FallbackVersion = $MatchingFallbackVersion[-1]
-                Write-Host "Return fallback version: $FallbackVersion (from $($MatchingFallbackId[-1]))"
-                return $FallbackVersion
+                Write-Host "Return fallback version: $FallbackVersion (from $FallbackId)"
+                return "$FallbackId=$FallbackVersion"
             }
         }
     }
@@ -249,8 +248,19 @@ function Install-TizenWorkload([string]$DotnetVersion)
     }
 
     # Check latest version of manifest.
+    #
+    # Get-LatestVersion returns "<packageId>=<version>". The id matters: when the
+    # requested band has no published manifest we fall back to an earlier band's
+    # package, and that version does not exist under the requested id. Both values are
+    # kept function-local so an -UpdateAllWorkloads run cannot carry one SDK's fallback
+    # package into the next SDK's install.
     if ($Version -eq "<latest>" -or $UpdateAllWorkloads.IsPresent) {
-        $Version = Get-LatestVersion -Id $ManifestName
+        $Resolved = Get-LatestVersion -Id $ManifestName
+        if (-not $Resolved) {
+            throw "Failed to resolve a manifest package for $ManifestName."
+        }
+        $ManifestName = $Resolved.Substring(0, $Resolved.LastIndexOf("="))
+        $Version = $Resolved.Substring($Resolved.LastIndexOf("=") + 1)
     }
 
     # Check workload manifest directory.
@@ -285,11 +295,7 @@ function Install-TizenWorkload([string]$DotnetVersion)
 
     # Install workload manifest.
     Write-Host "Installing $ManifestName/$Version to $ManifestDir..."
-    if ($global:FallbackId) {
-        Install-Pack -Id $global:FallbackId -Version $Version -Kind "manifest"
-    } else {
-        Install-Pack -Id $ManifestName -Version $Version -Kind "manifest"
-    }
+    Install-Pack -Id $ManifestName -Version $Version -Kind "manifest"
 
     # Download and install workload packs.
     $NewManifestJson = $(Get-Content $TizenManifestFile | ConvertFrom-Json)

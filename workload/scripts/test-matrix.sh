@@ -52,12 +52,20 @@ done
 #   run against the .NET 10 band stays green. To exercise these rows:
 #       make test-matrix DOTNET_VERSION=11.0.100-preview.7.26381.103
 MATRIX=(
+    # net8.0: oldest .NET major still exercised, across every current platform band.
     "net8.0-tizen10.0|10"
     "net8.0-tizen10.1|10.1"
     "net8.0-tizen11.0|11"
+    # net9.0
     "net9.0-tizen10.0|10"
-    "net11.0-tizen11.0|11"
+    # net10.0: the current shipping band. Covered explicitly rather than implied by the
+    # SDK version used to run the matrix.
+    "net10.0-tizen10.0|10"
+    "net10.0-tizen10.1|10.1"
+    "net10.0-tizen11.0|11"
+    # net11.0: the band this branch adds.
     "net11.0-tizen10.0|10"
+    "net11.0-tizen11.0|11"
 )
 
 # --- helpers ---------------------------------------------------------------
@@ -232,6 +240,42 @@ for entry in "${MATRIX[@]}"; do
         failed_rows+=("$tfm:build")
     fi
 done
+
+# --- self-contained disposition --------------------------------------------
+#
+# Samsung.NETCore.App.Runtime.tizen is a placeholder pack with no runtime binaries, so a
+# self-contained Tizen publish cannot work. It must fail with the actionable TIZENSDK001
+# rather than a raw XmlException from ResolveRuntimePackAssets parsing RuntimeList.xml,
+# or an opaque NETSDK1083.
+if [[ -z "$ONLY" && $pass_count -gt 0 ]]; then
+    sc_dir="$TMPDIR/selfcontained"
+    log ""
+    log "==> [self-contained disposition]"
+    rm -rf "$sc_dir" && mkdir -p "$sc_dir"
+    # Reuse whichever row built successfully; any Tizen project will do.
+    src_row="$(find "$TMPDIR" -maxdepth 1 -name 'net*-tizen*' -type d | head -1)"
+    if [[ -n "$src_row" ]]; then
+        cp "$src_row/TizenApp1.csproj" "$src_row/tizen-manifest.xml" "$sc_dir/" 2>/dev/null
+        cp -r "$src_row"/*.cs "$sc_dir/" 2>/dev/null
+        sc_log="$sc_dir/selfcontained.log"
+        if "$DOTNET" build "$sc_dir" --nologo -p:SelfContained=true > "$sc_log" 2>&1; then
+            fail "self-contained build unexpectedly SUCCEEDED (no runtime is shipped)"
+            fail_count+=1
+            failed_rows+=("selfcontained:unexpected-success")
+        elif grep -q "TIZENSDK001" "$sc_log"; then
+            pass "self-contained rejected with TIZENSDK001"
+            pass_count+=1
+        elif grep -qiE "XmlException|multiple root" "$sc_log"; then
+            fail "self-contained produced a raw XML parse error - RuntimeList.xml is malformed"
+            grep -iE "XmlException|multiple root" "$sc_log" | head -2 | sed 's/^/      | /'
+            fail_count+=1
+            failed_rows+=("selfcontained:xmlexception")
+        else
+            warn "self-contained failed before reaching the Tizen guard (see $sc_log)"
+            grep -m2 "error" "$sc_log" | sed 's/^/      | /'
+        fi
+    fi
+fi
 
 # --- summary ---------------------------------------------------------------
 

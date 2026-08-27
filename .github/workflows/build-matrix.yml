@@ -75,6 +75,9 @@ jobs:
     - name: Run test-template-conditions.sh
       run: bash workload/scripts/test-template-conditions.sh
 
+    - name: Run test-package-fallback.sh
+      run: bash workload/scripts/test-package-fallback.sh
+
     - name: Run test-install-failure.sh
       run: bash workload/scripts/test-install-failure.sh
 
@@ -82,9 +85,13 @@ jobs:
     name: Multi-TFM build matrix (${{ matrix.name }})
     needs: validate-metadata
     runs-on: ubuntu-22.04
-    # The .NET 11 leg is advisory only while the branch targets a shipping band. On a
-    # net11.0 branch (or a PR into one) .NET 11 is the product, so it must block.
-    continue-on-error: ${{ matrix.experimental && !(github.ref_name == 'net11.0' || github.base_ref == 'net11.0') }}
+    # The .NET 11 leg BLOCKS by default. The SDK version is pinned exactly
+    # (DotNet11SdkVersion), so the leg is deterministic - and a branch whose purpose is
+    # .NET 11 support gains nothing from an advisory-only .NET 11 gate.
+    #
+    # Set the repository variable TIZEN_NET11_ADVISORY=true to temporarily downgrade it,
+    # e.g. while chasing an upstream preview-SDK regression.
+    continue-on-error: ${{ matrix.experimental && vars.TIZEN_NET11_ADVISORY == 'true' }}
     strategy:
       fail-fast: false
       matrix:
