@@ -308,19 +308,43 @@ Check C6 now parses the file with a real XML parser and asserts the `TIZENSDK001
 
 ## Release retryability
 
-The release workflow is ordered so a failure is always retryable:
+The release workflow **reserves first, then builds**:
 
-1. resolve the version (no mutation yet),
-2. clean, build, and **verify** the expected artifacts on disk,
-3. only then commit and push the version bump,
-4. push packages from the verified staging directory,
-5. create the tag, targeting the commit that carries the released `Versions.props`.
+1. resolve the version (no mutation yet) and pin it as one immutable candidate,
+2. create the release commit and **reserve** it globally,
+3. check out the reserved SHA explicitly and build from *that* commit only,
+4. verify every staged package carries the reserved SHA,
+5. push packages from the verified staging directory,
+6. create the tag, targeting the reserved SHA.
 
-Committing the bump *before* the build meant a later failure left the branch already bumped, so
-the retry computed `OLD == NEW` and aborted — an unretryable release. `OLD == NEW` is therefore
-no longer an error: `next-workload-version.py` derives the next version from what is published
-on NuGet, so when the branch already carries the intended still-unpublished version the run
-**resumes** it. Re-creating an existing tag is a no-op.
+> **This deliberately reverses the earlier "commit only after a verified build" ordering.**
+> That ordering was adopted to keep a failed release retryable, but it cannot hold once a
+> resume has to rebuild: the Makefile embeds the current Git SHA in every package, so an
+> initial run and its retry produced packages built from *different* commits, and
+> skip-duplicate happily preserved that mixed set under a tag pointing at only one of them.
+> Retryability now comes from the **reservation**, not from deferring the commit — the
+> reserved SHA is the single source of truth that both the first attempt and every retry
+> build from, so provenance is identical by construction.
+
+`OLD == NEW` is not an error. `next-workload-version.py` derives the next version from what is
+published on NuGet, so when the branch already carries the intended still-unpublished version
+the run resumes it; there is simply nothing to commit, and the current HEAD *is* the release
+commit, so it is reserved as-is. Re-creating an existing tag is a no-op.
+
+### Reservation and concurrency
+
+Two branches or bands releasing at once could previously select the same next version, both
+push, and let skip-duplicate silently accept one owner's packs while the other's were dropped.
+Ownership is now explicit:
+
+* the job takes a repository-wide `concurrency` group (`cancel-in-progress: false`),
+* it claims `refs/tizen-release/v<version>` with an atomic create — losing the race aborts,
+* a retry must **prove** it owns the reservation (the ref must point at its release SHA);
+  a foreign reservation aborts rather than publishing over someone else's version.
+
+Because `workflow_dispatch` re-runs check out the *original* event SHA rather than the pushed
+bump commit, every downstream step checks out the reserved SHA explicitly and rejects source
+drift instead of silently building the wrong tree.
 
 A reference-only run (`release_manifest=false`) publishes no manifest and is completely
 non-mutating: no bump, no commit, no tag.
@@ -358,3 +382,39 @@ network blip would advance the version and strand the release it was meant to pr
 
 `scripts/test-release-workflow.sh` pins all of the above, including failure injection at each
 publication step.
+
+
+## Installer band selection
+
+`workload-install.sh` and `workload-install.ps1` must behave identically; `test-version-band.sh`
+extracts the real logic from both (never a hand-copy) and compares them case by case.
+
+**Closest band at or below the request.** When a manifest for the active band is unavailable the
+installer falls back — but it must fall back *downwards*. Selecting `10.0.300` for a `10.0.200`
+request skips the published `10.0.200` manifest entirely and installs a newer feature band's
+metadata. Both installers now order candidates with a numeric band sort key and choose the
+closest compatible band `<= ` the request, and the fallback returns the resolved **package ID
+and version together** — resolving only a version left the download using the original,
+unavailable manifest ID.
+
+**Explicit vs. derived target band.** `-t` / `-Tizen` is documented as supporting cross-band
+installation, so the "target band must equal the active SDK band" rule applies **only** to an
+auto-derived band. An explicitly requested band is honoured, and all inputs are validated
+*before* anything is written.
+
+**SDK pinning is validated before any mutation.** `install_tizenworkload` is invoked under `if !`,
+which suppresses `errexit` for everything it calls, so an unchecked `dotnet new globaljson` could
+fail and let the install proceed against the wrong SDK. Every pin command is now checked
+explicitly and the effective `dotnet --version` is re-read and compared before download.
+
+**Atomic manifest replacement.** The payload is staged and verified in a temporary directory
+alongside the destination, then swapped in atomically, with rollback of the previous manifest on
+any failure. Previously a partial copy could destroy a working manifest, and the leftover
+directory made a subsequent existence check pass.
+
+**SDK bootstrap is keyed by full SDK version.** `DOTNET_DESTDIR` and the install stamp include
+the exact SDK version (`10.0.100` vs `10.0.101` vs a preview build), so `make install` no longer
+reuses a stale SDK that merely shares a feature band. Manifest paths remain band-based.
+
+Shell tests run under stock macOS Bash 3.2 (no `${var,,}`), and cover spaced paths, empty and
+transport-failed version queries, and mixed-band `UpdateAllWorkloads`.

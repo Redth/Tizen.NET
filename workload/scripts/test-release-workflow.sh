@@ -64,7 +64,8 @@ line_of() {
 
 BUILD_LN=$(line_of "    - name: Build")
 STAGE_LN=$(line_of "    - name: Stage and verify packages")
-COMMIT_LN=$(line_of "    - name: Commit and push the version bump")
+RESERVE_LN=$(line_of "    - name: Resolve and reserve release version")
+CHECKOUT_LN=$(line_of "    - name: Check out the reserved release commit")
 PUSH_LN=$(line_of "    - name: Push SDK/Runtime/Templates packs")
 REL_LN=$(line_of "    - name: Create GitHub Release")
 
@@ -73,33 +74,59 @@ REL_LN=$(line_of "    - name: Create GitHub Release")
 assert "build runs before staging" \
     "$([[ -n "$BUILD_LN" && -n "$STAGE_LN" && "$BUILD_LN" -lt "$STAGE_LN" ]] && echo 1 || echo 0)"
 
-assert "version bump is persisted AFTER staging verification" \
-    "$([[ -n "$STAGE_LN" && -n "$COMMIT_LN" && "$STAGE_LN" -lt "$COMMIT_LN" ]] && echo 1 || echo 0)"
+# The release commit is now created FIRST so every package embeds the same SHA as the tag.
+# Retryability comes from the reservation ref + resume detection, not from deferring it.
+assert "version is reserved before the build" \
+    "$([[ -n "$RESERVE_LN" && -n "$BUILD_LN" && "$RESERVE_LN" -lt "$BUILD_LN" ]] && echo 1 || echo 0)"
 
-assert "version bump is persisted BEFORE packages are pushed" \
-    "$([[ -n "$COMMIT_LN" && -n "$PUSH_LN" && "$COMMIT_LN" -lt "$PUSH_LN" ]] && echo 1 || echo 0)"
+assert "reserved commit is checked out before the build" \
+    "$([[ -n "$CHECKOUT_LN" && -n "$BUILD_LN" && "$CHECKOUT_LN" -lt "$BUILD_LN" ]] && echo 1 || echo 0)"
+
+assert "ownership is claimed via an atomic reservation ref" \
+    "$(grep -q 'refs/tizen-release/v' "$WF" && echo 1 || echo 0)"
+
+assert "a foreign reservation aborts the run" \
+    "$(grep -q 'already reserved by another release' "$WF" && echo 1 || echo 0)"
+
+assert "releases are serialized by a concurrency group" \
+    "$(grep -q 'group: tizen-workload-release' "$WF" && echo 1 || echo 0)"
+
+assert "in-flight releases are never cancelled" \
+    "$(grep -q 'cancel-in-progress: false' "$WF" && echo 1 || echo 0)"
+
+assert "the build runs from the reserved SHA, not the event SHA" \
+    "$(grep -q 'git checkout --detach "\$SHA"' "$WF" && echo 1 || echo 0)"
+
+assert "source drift against the reserved version is rejected" \
+    "$(grep -q 'Source drift' "$WF" && echo 1 || echo 0)"
+
+assert "the applied version is pinned explicitly (--set-version)" \
+    "$(grep -q 'next-workload-version.py --apply --set-version' "$WF" && echo 1 || echo 0)"
+
+assert "every package is verified to carry the reserved commit" \
+    "$(grep -q 'do not all originate from the reserved release commit' "$WF" && echo 1 || echo 0)"
 
 assert "release tag is created last" \
     "$([[ -n "$PUSH_LN" && -n "$REL_LN" && "$PUSH_LN" -lt "$REL_LN" ]] && echo 1 || echo 0)"
 
 # --- retryability / non-mutation --------------------------------------------
 
-assert "OLD == NEW resumes instead of aborting" \
-    "$(grep -q 'Resuming release of' "$WF" && ! grep -q 'ERROR: computed next == current' "$WF" && echo 1 || echo 0)"
+assert "OLD == NEW reserves the current commit instead of failing" \
+    "$(grep -q 'is already \$NEW; reserving the current commit' "$WF" && ! grep -q 'ERROR: computed next == current' "$WF" && echo 1 || echo 0)"
 
 assert "reference-only run is non-mutating" \
     "$(grep -q 'Reference-only run: leaving TizenWorkloadVersion' "$WF" && echo 1 || echo 0)"
 
-assert "commit step is skipped when nothing was mutated" \
-    "$(grep -q 'steps.bump.outputs.mutated' "$WF" && echo 1 || echo 0)"
+assert "a resumed run rebuilds from the reservation's commit" \
+    "$(grep -q 'no reservation ref exists' "$WF" && echo 1 || echo 0)"
 
 assert "build is not continue-on-error" \
     "$(awk -v s="$BUILD_LN" -v e="$STAGE_LN" 'NR>s && NR<e && /continue-on-error/ {found=1} END{exit !found}' "$WF" && echo 0 || echo 1)"
 
 # --- correctness of what gets published -------------------------------------
 
-assert "tag targets the released commit, not just the branch ref" \
-    "$(grep -q 'steps.commit.outputs.release_sha' "$WF" && echo 1 || echo 0)"
+assert "tag targets the reserved release commit" \
+    "$(grep -q 'target "\${{ steps.bump.outputs.release_sha }}"' "$WF" && echo 1 || echo 0)"
 
 assert "release notes use the staged manifest id" \
     "$(grep -q 'steps.stage.outputs.manifest_id' "$WF" && echo 1 || echo 0)"
@@ -129,7 +156,7 @@ assert "a partially published version is resumed, never advanced" \
     "$(grep -q 'is partially published' "$WF" && echo 1 || echo 0)"
 
 assert "a published-but-untagged version is resumed to finish the tag" \
-    "$(grep -q 'fully published but has no release tag' "$WF" && echo 1 || echo 0)"
+    "$(grep -q 'is published but untagged' "$WF" && echo 1 || echo 0)"
 
 assert "companion packs are pushed BEFORE the manifest" \
     "$([[ -n "$COMPANION_PUSH_LN" && -n "$MANIFEST_PUSH_LN" && "$COMPANION_PUSH_LN" -lt "$MANIFEST_PUSH_LN" ]] && echo 1 || echo 0)"

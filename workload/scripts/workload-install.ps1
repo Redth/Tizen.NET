@@ -130,18 +130,28 @@ function Get-LatestVersion([string]$Id) {
         $BandPrefix = Get-BandFamilyPrefix -ManifestId $Id
         if ($BandPrefix)
         {
-            $MatchingFallbackId = @()
-            $MatchingFallbackVersion = @()
+            # Choose the CLOSEST band <= the requested one. Taking the last/highest match
+            # meant a request for 10.0.200 resolved to 10.0.300 - a NEWER band, whose
+            # manifest may not be valid for the requested SDK - while skipping a perfectly
+            # good 10.0.200 or 10.0.100. Must match getLatestVersion in workload-install.sh.
+            $RequestedBand = $Id.Substring($Id.IndexOf("-") + 1)
+            $RequestedKey  = Get-BandSortKey -Band $RequestedBand
+            $FallbackId = ""
+            $FallbackVersion = ""
+            $BestKey = ""
             foreach ($key in $LatestVersionMap.Keys) {
-                if ($key -like "$BandPrefix*") {
-                    $MatchingFallbackId += $key
-                    $MatchingFallbackVersion += $LatestVersionMap[$key]
+                if ($key -notlike "$BandPrefix*") { continue }
+                $CandidateBand = $key.Substring($key.IndexOf("-") + 1)
+                $CandidateKey  = Get-BandSortKey -Band $CandidateBand
+                if ([string]::Compare($CandidateKey, $RequestedKey, $false) -gt 0) { continue }
+                if ($BestKey -eq "" -or [string]::Compare($CandidateKey, $BestKey, $false) -gt 0) {
+                    $BestKey = $CandidateKey
+                    $FallbackId = $key
+                    $FallbackVersion = $LatestVersionMap[$key]
                 }
             }
-            if ($MatchingFallbackVersion)
+            if ($FallbackId)
             {
-                $FallbackId = $MatchingFallbackId[-1]
-                $FallbackVersion = $MatchingFallbackVersion[-1]
                 Write-Host "Return fallback version: $FallbackVersion (from $FallbackId)"
                 return "$FallbackId=$FallbackVersion"
             }
@@ -240,6 +250,21 @@ function Get-BandFamilyPrefix([string]$ManifestId)
     if (-not $Match.Success) { return "" }
     return $ManifestId.Substring(0, $ManifestId.IndexOf("-") + 1) + $Match.Groups[1].Value + "."
 }
+# Comparable sort key for an SDK feature band, e.g. '10.0.300' or '11.0.100-preview.7'.
+# Zero-padded so ordinal string comparison orders bands correctly, with pre-release bands
+# sorting BEFORE the corresponding stable band ('0' < '1').
+function Get-BandSortKey([string]$Band)
+{
+    $Core = $Band.Split('-')[0]
+    $Pre  = if ($Band.Contains('-')) { $Band.Substring($Band.IndexOf('-') + 1) } else { "" }
+    $Parts = $Core.Split('.')
+    $Major = [int]($Parts[0]); $Minor = [int]($Parts[1]); $Patch = [int]($Parts[2])
+    if ($Pre) {
+        return ('{0:D5}{1:D5}{2:D5}0{3}' -f $Major, $Minor, $Patch, $Pre)
+    }
+    return ('{0:D5}{1:D5}{2:D5}1' -f $Major, $Minor, $Patch)
+}
+
 # END VERSION BAND DETECTION
 
 function Install-TizenWorkload([string]$DotnetVersion)

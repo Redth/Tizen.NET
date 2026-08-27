@@ -161,12 +161,29 @@ function getLatestVersion () {
         return
     fi
     local prefix="${manifestId%%-*}-${family}."
+    local requestedBand="${manifestId#*-}"
+    local requestedKey; requestedKey="$(band_sort_key "$requestedBand")"
+
+    # Choose the CLOSEST band that is <= the requested one. Taking the last/highest match
+    # meant a request for 10.0.200 resolved to 10.0.300 - a NEWER band, whose manifest may
+    # not be valid for the requested SDK - while skipping a perfectly good 10.0.200 or
+    # 10.0.100. Bands are ordered by a numeric key so map order is irrelevant.
     local fallbackId=""
     local fallbackVersion=""
+    local bestKey=""
     for entry in "${LatestVersionMap[@]}"; do
         mapKey="${entry%%=*}"
         mapValue="${entry#*=}"
-        if [[ "$mapKey" == "$prefix"* ]]; then
+        case "$mapKey" in
+            "$prefix"*) ;;
+            *) continue ;;
+        esac
+        local candidateBand="${mapKey#*-}"
+        local candidateKey; candidateKey="$(band_sort_key "$candidateBand")"
+        # Skip anything newer than what was asked for.
+        [[ "$candidateKey" > "$requestedKey" ]] && continue
+        if [[ -z "$bestKey" || "$candidateKey" > "$bestKey" ]]; then
+            bestKey="$candidateKey"
             fallbackId="$mapKey"
             fallbackVersion="$mapValue"
         fi
@@ -212,6 +229,25 @@ function compute_target_version_band() {
     fi
     echo "$band"
 }
+# Comparable sort key for an SDK feature band, e.g. '10.0.300' or '11.0.100-preview.7'.
+# Zero-padded so plain string comparison orders bands correctly, with pre-release bands
+# sorting BEFORE the corresponding stable band ('0' < '1').
+band_sort_key() {
+    local band="$1"
+    local core="${band%%-*}"
+    local pre=""
+    [[ "$band" == *-* ]] && pre="${band#*-}"
+    local IFS='.'
+    local -a parts
+    read -r -a parts <<< "$core"
+    local major="${parts[0]:-0}" minor="${parts[1]:-0}" patch="${parts[2]:-0}"
+    if [[ -n "$pre" ]]; then
+        printf '%05d%05d%05d0%s\n' "$major" "$minor" "$patch" "$pre"
+    else
+        printf '%05d%05d%05d1\n' "$major" "$minor" "$patch"
+    fi
+}
+
 # END VERSION BAND DETECTION
 
 function install_tizenworkload() {
@@ -226,10 +262,18 @@ function install_tizenworkload() {
         MANIFEST_VERSION="<latest>"
     fi
 
-    # Check version band
+    # Check version band.
+    #
+    # -t/--dotnet-target-version-band deliberately installs into a DIFFERENT band than the
+    # running SDK (documented: verifying a workload against the next band). Remember which
+    # case applies so the post-pin equality check below is applied only when the band was
+    # derived automatically.
+    TARGET_BAND_IS_EXPLICIT="false"
     if [[ "$DOTNET_TARGET_VERSION_BAND" == "<auto>" ]]; then
         DOTNET_TARGET_VERSION_BAND=$(compute_target_version_band "$DOTNET_VERSION")
         MANIFEST_NAME="$MANIFEST_BASE_NAME-$DOTNET_TARGET_VERSION_BAND"
+    else
+        TARGET_BAND_IS_EXPLICIT="true"
     fi
 
     # Check latest version of manifest.
@@ -262,6 +306,50 @@ function install_tizenworkload() {
         return 1
     fi
 
+    # Pin and validate the SDK BEFORE touching anything on disk.
+    #
+    # This used to run after the manifest had already been copied, so a pin failure left a
+    # replaced manifest behind. All validation now happens before the first mutation.
+    if [ -f global.json ]; then
+        CACHE_GLOBAL_JSON="true"
+        mv global.json global.json.bak
+    else
+        CACHE_GLOBAL_JSON="false"
+    fi
+
+    restore_global_json() {
+        rm -f global.json
+        if [[ "$CACHE_GLOBAL_JSON" == "true" ]]; then mv global.json.bak global.json; fi
+    }
+
+    # This function is invoked under `if !`, which disables errexit for everything it calls,
+    # so every command here is checked explicitly.
+    if ! "$DOTNET_INSTALL_DIR/dotnet" new globaljson --sdk-version "$DOTNET_VERSION" --force >/dev/null; then
+        echo "Failed to pin SDK $DOTNET_VERSION via global.json."
+        restore_global_json
+        return 1
+    fi
+
+    EFFECTIVE_VERSION="$("$DOTNET_INSTALL_DIR/dotnet" --version 2>/dev/null)"
+    if [ "$EFFECTIVE_VERSION" != "$DOTNET_VERSION" ]; then
+        echo "SDK pin did not take effect: requested $DOTNET_VERSION, active ${EFFECTIVE_VERSION:-<unknown>}."
+        restore_global_json
+        return 1
+    fi
+
+    # The active SDK must match the destination band ONLY when that band was derived from
+    # the SDK. An explicit -t is a deliberate cross-band install.
+    if [[ "$TARGET_BAND_IS_EXPLICIT" != "true" ]]; then
+        EFFECTIVE_BAND="$(compute_target_version_band "$EFFECTIVE_VERSION")"
+        if [ "$EFFECTIVE_BAND" != "$DOTNET_TARGET_VERSION_BAND" ]; then
+            echo "Band mismatch: manifest targets $DOTNET_TARGET_VERSION_BAND but the active SDK resolves to $EFFECTIVE_BAND."
+            restore_global_json
+            return 1
+        fi
+    else
+        echo "Installing into explicitly requested band $DOTNET_TARGET_VERSION_BAND (active SDK $EFFECTIVE_VERSION)."
+    fi
+
     # Check workload manifest directory.
     SDK_MANIFESTS_DIR="$DOTNET_INSTALL_DIR/sdk-manifests/$DOTNET_TARGET_VERSION_BAND"
     ensure_directory "$SDK_MANIFESTS_DIR"
@@ -287,60 +375,62 @@ function install_tizenworkload() {
     fi
     chmod 744 "$TMPDIR"/unzipped/data/*
 
-    # Copy manifest files to dotnet sdk.
-    mkdir -p "$SDK_MANIFESTS_DIR/samsung.net.sdk.tizen"
-    cp -f "$TMPDIR"/unzipped/data/* "$SDK_MANIFESTS_DIR/samsung.net.sdk.tizen/"
-
-    if [ ! -f "$SDK_MANIFESTS_DIR/samsung.net.sdk.tizen/WorkloadManifest.json" ]; then
-        echo "Installation is failed."
-        rm -fr $TMPDIR
+    # Verify the STAGED payload before replacing anything. Checking the destination instead
+    # meant a leftover manifest from a previous install could satisfy the check even when
+    # this download had produced nothing usable.
+    if [ ! -f "$TMPDIR/unzipped/data/WorkloadManifest.json" ]; then
+        echo "Downloaded package does not contain WorkloadManifest.json."
+        rm -fr "$TMPDIR"
+        restore_global_json
         return 1
     fi
 
-    # Install workload packs.
-    if [ -f global.json ]; then
-        CACHE_GLOBAL_JSON="true"
-        mv global.json global.json.bak
-    else
-        CACHE_GLOBAL_JSON="false"
+    # Replace the destination atomically: build the new directory alongside the old one,
+    # swap, and roll the previous contents back if any step fails. An interrupted in-place
+    # copy previously left a half-replaced manifest directory.
+    MANIFEST_DEST="$SDK_MANIFESTS_DIR/samsung.net.sdk.tizen"
+    MANIFEST_NEW="$SDK_MANIFESTS_DIR/.samsung.net.sdk.tizen.new.$$"
+    MANIFEST_OLD="$SDK_MANIFESTS_DIR/.samsung.net.sdk.tizen.old.$$"
+    rm -fr "$MANIFEST_NEW" "$MANIFEST_OLD"
+
+    if ! mkdir -p "$MANIFEST_NEW" || ! cp -f "$TMPDIR"/unzipped/data/* "$MANIFEST_NEW/"; then
+        echo "Failed to stage manifest files."
+        rm -fr "$MANIFEST_NEW" "$TMPDIR"
+        restore_global_json
+        return 1
     fi
-    # Pin the SDK for the install. Use the dotnet under test - not whatever 'dotnet' the
-    # PATH resolves to - and CHECK the result: this function is invoked under `if !`, which
-    # disables errexit for everything it calls, so an unchecked failure here would leave the
-    # workload to be installed against the wrong SDK.
-    if ! "$DOTNET_INSTALL_DIR/dotnet" new globaljson --sdk-version "$DOTNET_VERSION" --force; then
-        echo "Failed to pin SDK $DOTNET_VERSION via global.json."
-        rm -f global.json
-        if [[ "$CACHE_GLOBAL_JSON" == "true" ]]; then mv global.json.bak global.json; fi
+    if [ ! -f "$MANIFEST_NEW/WorkloadManifest.json" ]; then
+        echo "Staged manifest is incomplete."
+        rm -fr "$MANIFEST_NEW" "$TMPDIR"
+        restore_global_json
         return 1
     fi
 
-    # Verify the pin actually took effect before installing anything.
-    EFFECTIVE_VERSION="$("$DOTNET_INSTALL_DIR/dotnet" --version 2>/dev/null)"
-    if [ "$EFFECTIVE_VERSION" != "$DOTNET_VERSION" ]; then
-        echo "SDK pin did not take effect: requested $DOTNET_VERSION, active ${EFFECTIVE_VERSION:-<unknown>}."
-        rm -f global.json
-        if [[ "$CACHE_GLOBAL_JSON" == "true" ]]; then mv global.json.bak global.json; fi
-        return 1
+    HAD_PREVIOUS="false"
+    if [ -d "$MANIFEST_DEST" ]; then
+        if ! mv "$MANIFEST_DEST" "$MANIFEST_OLD"; then
+            echo "Failed to set aside the existing manifest."
+            rm -fr "$MANIFEST_NEW" "$TMPDIR"
+            restore_global_json
+            return 1
+        fi
+        HAD_PREVIOUS="true"
     fi
 
-    EFFECTIVE_BAND="$(compute_target_version_band "$EFFECTIVE_VERSION")"
-    if [ "$EFFECTIVE_BAND" != "$DOTNET_TARGET_VERSION_BAND" ]; then
-        echo "Band mismatch: manifest installed for $DOTNET_TARGET_VERSION_BAND but the active SDK resolves to $EFFECTIVE_BAND."
-        rm -f global.json
-        if [[ "$CACHE_GLOBAL_JSON" == "true" ]]; then mv global.json.bak global.json; fi
+    if ! mv "$MANIFEST_NEW" "$MANIFEST_DEST"; then
+        echo "Failed to install the new manifest; rolling back."
+        if [[ "$HAD_PREVIOUS" == "true" ]]; then mv "$MANIFEST_OLD" "$MANIFEST_DEST"; fi
+        rm -fr "$MANIFEST_NEW" "$TMPDIR"
+        restore_global_json
         return 1
     fi
-
+    rm -fr "$MANIFEST_OLD"
     "$DOTNET_INSTALL_DIR/dotnet" workload install tizen --skip-manifest-update
     local install_status=$?
 
     # Clean-up
     rm -fr "$TMPDIR"
-    rm -f global.json
-    if [[ "$CACHE_GLOBAL_JSON" == "true" ]]; then
-        mv global.json.bak global.json
-    fi
+    restore_global_json
 
     if [ $install_status -ne 0 ]; then
         echo "Failed to install Tizen workload packs for $DOTNET_VERSION (exit $install_status)."

@@ -59,7 +59,7 @@ $(eval $(call CreateNuGetPkgs,Samsung.NETCore.App.Runtime,$(TIZEN_WORKLOAD_VERSI
 packs: $(NUPKG_TARGETS)
 
 # Install workload to the dotnet sdk
-INSTALL_STAMP = $(TMPDIR)/.stamp-install-workload-$(DOTNET_VERSION_BAND)
+INSTALL_STAMP = $(TMPDIR)/.stamp-install-workload-$(DOTNET_VERSION)
 
 $(INSTALL_STAMP): | $(DOTNET_MANIFESTS_DESTDIR)
 	@cp -f \

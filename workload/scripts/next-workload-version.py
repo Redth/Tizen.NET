@@ -102,14 +102,31 @@ def find_manifest_package_ids(verbose: bool = False) -> list[str]:
 
 
 def fetch_versions(pid: str, verbose: bool = False) -> list[str]:
+    """Versions of an authoritative package.
+
+    Any transport, status or parse failure ABORTS. Returning an empty list on failure
+    silently lowered the global maximum: if the query that failed happened to be the
+    package holding the highest build counter, the next version would collide with one
+    that is already published. Being unable to see the whole picture is never the same
+    as seeing an empty one.
+    """
     url = FLATCONTAINER_FMT.format(id=pid)
     try:
         data = fetch_json(url)
-    except SystemExit:
-        if verbose:
-            print(f"[verbose] failed to fetch versions for {pid}", file=sys.stderr)
-        return []
-    return data.get("versions", [])
+    except SystemExit as exc:
+        raise SystemExit(
+            f"failed to fetch versions for {pid}: {exc}. Refusing to derive a version "
+            f"from incomplete feed data."
+        )
+    if not isinstance(data, dict) or "versions" not in data:
+        raise SystemExit(
+            f"unexpected response for {pid} (no 'versions' array). Refusing to derive a "
+            f"version from unparseable feed data."
+        )
+    versions = data.get("versions")
+    if not isinstance(versions, list):
+        raise SystemExit(f"unexpected 'versions' payload for {pid}: {type(versions).__name__}")
+    return versions
 
 
 def parse_version(v: str) -> tuple[int, int, int] | None:
@@ -183,10 +200,21 @@ def main() -> int:
     p.add_argument("--versions-props", default=None,
                    help="Path to Versions.props (default: workload/build/Versions.props relative to this script).")
     p.add_argument("--verbose", action="store_true", help="Print diagnostics on stderr.")
+    p.add_argument("--set-version", default=None,
+                   help="Write this exact version instead of re-deriving it. Use with --apply "
+                        "so a caller that already computed a candidate cannot have a "
+                        "concurrent release change the value between compute and apply.")
     args = p.parse_args()
 
-    major, minor, build = find_max_triple(verbose=args.verbose)
-    next_value = f"{major}.{minor}.{build + 1}"
+    if args.set_version:
+        if not args.apply:
+            raise SystemExit("--set-version requires --apply")
+        next_value = args.set_version.strip()
+        if not VERSION_RE.match(next_value):
+            raise SystemExit(f"--set-version {next_value!r} is not a valid workload version")
+    else:
+        major, minor, build = find_max_triple(verbose=args.verbose)
+        next_value = f"{major}.{minor}.{build + 1}"
 
     if args.apply:
         if args.versions_props:

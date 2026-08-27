@@ -46,10 +46,11 @@ PRERELEASE_VERSION = $(word 5,$(VERSIONS))
 
 # DOTNET_DESTDIR
 ifeq ($(DESTDIR),)
-	# Band-scoped: `make install DOTNET_VERSION=11...` in a tree that already built the
-	# .NET 10 band must bootstrap a separate SDK instead of reusing (and silently
-	# testing) the old one.
-	DOTNET_DESTDIR = $(OUTDIR)/dotnet-$(DOTNET_VERSION_BAND)
+	# Keyed by the FULL SDK version, not the feature band. Band-keying meant 10.0.100 and
+	# 10.0.101 (or two different previews of one band) shared a bootstrap directory, so the
+	# second request silently reused the first SDK and tested the wrong build. Manifest
+	# paths stay band-based below, which is what the SDK itself expects.
+	DOTNET_DESTDIR = $(OUTDIR)/dotnet-$(DOTNET_VERSION)
 else
 	DOTNET_DESTDIR = $(abspath $(DESTDIR))
 endif

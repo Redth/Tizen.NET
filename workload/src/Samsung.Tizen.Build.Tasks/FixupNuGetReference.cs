@@ -94,17 +94,20 @@ namespace Samsung.Tizen.Build.Tasks
 
         Log.LogMessage ($"Selected fallback '{Path.GetFileName (selectedDirectory)}' for {parentPath}");
 
-        // Remove the netstandard assembly only when the SELECTED directory supplies it, so a
-        // package is never left half-substituted.
+        // Replace the package's netstandard asset group ATOMICALLY - remove ALL of it, not
+        // just the files the fallback happens to share a name with.
+        //
+        // Removing only name-matching assets left the remaining netstandard DLLs in the
+        // reference set, so the build ended up with a mixture: some assemblies from the
+        // platform-specific TFM and some from netstandard, for the SAME package. That is the
+        // very mixing this selection is meant to prevent, and it silently reintroduces the
+        // netstandard build of any assembly the fallback group happens not to carry.
         foreach (var item in package.Value) {
-          var path = Path.Combine (selectedDirectory, Path.GetFileName (item.ItemSpec));
-          if (File.Exists (path)) {
-            Log.LogMessage ($"Removing: {item.ItemSpec}");
-            assembliesToRemove.Add (item);
-          }
+          Log.LogMessage ($"Removing: {item.ItemSpec}");
+          assembliesToRemove.Add (item);
         }
 
-        // All substituted assemblies for this package come from that one directory.
+        // ...and add the selected group's assets in their entirety.
         foreach (var assembly in Directory.GetFiles (selectedDirectory, "*.dll")) {
           var assemblyName = Path.GetFileName (assembly);
           if (!assembliesToAdd.ContainsKey (assemblyName)) {

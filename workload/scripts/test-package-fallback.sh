@@ -74,7 +74,7 @@ CASES=(
 for case in "${CASES[@]}"; do
     IFS='|' read -r tfv tpv want_present want_absent <<< "$case"
 
-    out="$("$DOTNET" msbuild "$TMPDIR/probe.proj" -t:Probe -nologo -v:m \
+    out="$("$DOTNET" msbuild "$TMPDIR/probe.proj" -t:Probe -nologo -v:m -nodereuse:false \
             -p:TargetFrameworkVersion="$tfv" -p:TargetPlatformVersion="$tpv" 2>&1 \
             | grep -o 'RESULT|.*' | head -1)"
     list=";${out#RESULT|};"
@@ -125,9 +125,10 @@ echo "-- selection priority / atomicity --"
 TASK_PROJ="$WORKLOAD_DIR/src/Samsung.Tizen.Build.Tasks/Samsung.Tizen.Build.Tasks.csproj"
 TASK_DLL="$WORKLOAD_DIR/src/Samsung.Tizen.Build.Tasks/bin/Release/netstandard2.0/Samsung.Tizen.Build.Tasks.dll"
 
-if [[ ! -f "$TASK_DLL" ]]; then
-    "$DOTNET" build "$TASK_PROJ" -c Release --nologo -v:q >/dev/null 2>&1 || true
-fi
+# Always rebuild: a stale DLL would let the suite validate code that is no longer the
+# source of truth. MSBuild node reuse is disabled everywhere below for the same reason -
+# a persistent node caches the loaded task assembly across invocations.
+"$DOTNET" build "$TASK_PROJ" -c Release --nologo -v:q -nodereuse:false >/dev/null 2>&1 || true
 
 # "<label>|<priority list>|<dirs to create>|<expected winner>|<dirs that get Extras.dll>"
 #
@@ -190,7 +191,7 @@ else
 </Project>
 PROJEOF
 
-            out="$("$DOTNET" msbuild "$TMPDIR/fixup$ci.proj" -t:Probe -nologo -v:m 2>&1 | grep -o 'ADDED|.*' | head -1)"
+            out="$("$DOTNET" msbuild "$TMPDIR/fixup$ci.proj" -t:Probe -nologo -v:m -nodereuse:false 2>&1 | grep -o 'ADDED|.*' | head -1)"
             added="${out#ADDED|}"
             bad=0; seen=""
             [[ -z "$added" ]] && bad=1
@@ -209,6 +210,69 @@ PROJEOF
                 fail=$((fail + 1))
             fi
         done
+    done
+fi
+
+# --- final asset set: no netstandard remnants --------------------------------
+#
+# Selecting one fallback TFM is not enough. The task must remove the package's ENTIRE
+# netstandard asset group, not just the files the fallback happens to share a name with -
+# otherwise the leftover netstandard DLLs stay in the reference set and the build mixes
+# platform-specific and netstandard assemblies from the SAME package.
+#
+# Fixture: netstandard2.0 carries A.dll AND B.dll, but the winning TFM carries only A.dll.
+# The final set (originals minus removed, plus added) must contain NO netstandard asset.
+
+echo ""
+echo "-- final asset set has no netstandard remnants --"
+
+if [[ ! -f "$TASK_DLL" ]]; then
+    printf "  %sSKIP%s  task assembly unavailable\n" "$c_yellow" "$c_reset"
+else
+    for order in forward reverse; do
+        pkgroot="$TMPDIR/remnant-$order/lib"
+        rm -rf "$pkgroot"; mkdir -p "$pkgroot/netstandard2.0"
+        printf 'ns' > "$pkgroot/netstandard2.0/A.dll"
+        printf 'ns' > "$pkgroot/netstandard2.0/B.dll"
+        if [[ "$order" == "forward" ]]; then dirs="net9.0-tizen9.0 net6.0-tizen8.0"; else dirs="net6.0-tizen8.0 net9.0-tizen9.0"; fi
+        for d in $dirs; do mkdir -p "$pkgroot/$d"; done
+        # Winner carries ONLY A.dll; B.dll exists solely as a netstandard asset.
+        printf 'net9.0-tizen9.0' > "$pkgroot/net9.0-tizen9.0/A.dll"
+        printf 'net6.0-tizen8.0' > "$pkgroot/net6.0-tizen8.0/A.dll"
+        printf 'net6.0-tizen8.0' > "$pkgroot/net6.0-tizen8.0/B.dll"
+
+        cat > "$TMPDIR/remnant-$order.proj" <<PROJEOF
+<Project>
+  <UsingTask TaskName="Samsung.Tizen.Build.Tasks.FixupNuGetReferences" AssemblyFile="$TASK_DLL" />
+  <Target Name="Probe">
+    <ItemGroup>
+      <CopyLocal Include="$pkgroot/netstandard2.0/A.dll" />
+      <CopyLocal Include="$pkgroot/netstandard2.0/B.dll" />
+    </ItemGroup>
+    <Samsung.Tizen.Build.Tasks.FixupNuGetReferences
+        PackageTargetFallback="net9.0-tizen9.0;net6.0-tizen8.0"
+        CopyLocalItems="@(CopyLocal)">
+      <Output TaskParameter="AssembliesToAdd" ItemName="Added" />
+      <Output TaskParameter="AssembliesToRemove" ItemName="Removed" />
+    </Samsung.Tizen.Build.Tasks.FixupNuGetReferences>
+    <ItemGroup>
+      <Final Include="@(CopyLocal)" Exclude="@(Removed)" />
+      <Final Include="@(Added)" />
+    </ItemGroup>
+    <Message Importance="high" Text="FINAL|@(Final)" />
+  </Target>
+</Project>
+PROJEOF
+
+        out="$("$DOTNET" msbuild "$TMPDIR/remnant-$order.proj" -t:Probe -nologo -v:m -nodereuse:false 2>&1 | grep -o 'FINAL|.*' | head -1)"
+        final="${out#FINAL|}"
+        if [[ -n "$final" ]] && ! grep -q 'netstandard2\.0' <<< "$final"; then
+            printf "  %sPASS%s  [%-7s] final set free of netstandard assets\n" "$c_green" "$c_reset" "$order"
+            pass=$((pass + 1))
+        else
+            printf "  %sFAIL%s  [%-7s] netstandard asset survived: %s\n" "$c_red" "$c_reset" "$order" "${final:-<none>}"
+            fail=$((fail + 1))
+        fi
     done
 fi
 
