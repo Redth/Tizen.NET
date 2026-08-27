@@ -95,7 +95,16 @@ function Get-LatestVersion([string]$Id) {
         try
         {
             $Response = Invoke-WebRequest -Uri https://api.nuget.org/v3-flatcontainer/$($Id.ToLowerInvariant())/index.json -UseBasicParsing | ConvertFrom-Json
-            return "$Id=$($Response.versions | Select-Object -Last 1)"
+            $Selected = $Response.versions | Where-Object { $_ -and $_.Trim() } | Select-Object -Last 1
+            if ($Selected) {
+                return "$Id=$($Selected.Trim())"
+            }
+            # An empty or all-blank versions[] is NOT a usable answer. Returning "$Id="
+            # here would be truthy, and the NuGet v2 package endpoint serves the LATEST
+            # version when given a versionless URL - silently installing an arbitrary
+            # package. Fall through to the retry/version-map path instead.
+            Write-Host "Id: $Id"
+            Write-Host "The feed returned no usable versions."
         }
         catch {
             Write-Host "Id: $Id"
@@ -256,11 +265,19 @@ function Install-TizenWorkload([string]$DotnetVersion)
     # package into the next SDK's install.
     if ($Version -eq "<latest>" -or $UpdateAllWorkloads.IsPresent) {
         $Resolved = Get-LatestVersion -Id $ManifestName
-        if (-not $Resolved) {
+        if (-not $Resolved -or -not $Resolved.Contains("=")) {
             throw "Failed to resolve a manifest package for $ManifestName."
         }
-        $ManifestName = $Resolved.Substring(0, $Resolved.LastIndexOf("="))
-        $Version = $Resolved.Substring($Resolved.LastIndexOf("=") + 1)
+        $ResolvedId      = $Resolved.Substring(0, $Resolved.LastIndexOf("="))
+        $ResolvedVersion = $Resolved.Substring($Resolved.LastIndexOf("=") + 1)
+        # Defence in depth: never proceed with an empty version. The NuGet v2 package
+        # endpoint serves the LATEST version when the URL has no version segment, so an
+        # empty value would silently install an arbitrary package.
+        if ([string]::IsNullOrWhiteSpace($ResolvedId) -or [string]::IsNullOrWhiteSpace($ResolvedVersion)) {
+            throw "Resolved an invalid manifest package '$Resolved' for $ManifestName."
+        }
+        $ManifestName = $ResolvedId
+        $Version      = $ResolvedVersion
     }
 
     # Check workload manifest directory.

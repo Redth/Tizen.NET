@@ -299,6 +299,118 @@ else
     fail=$((fail + 1))
 fi
 
+# --- 9. SDK pin must be verified before installing -----------------------------
+#
+# install_tizenworkload is invoked under `if !`, which disables errexit for everything it
+# calls. An unchecked `dotnet new globaljson` therefore let the install proceed against
+# whatever SDK the PATH happened to resolve. The pin is now checked, and the EFFECTIVE
+# version/band re-verified, before any pack is installed.
+
+echo ""
+echo "-- SDK pin verified before install --"
+
+PINDIR="$TMPROOT/pinbad"
+mkdir -p "$PINDIR"
+cat > "$PINDIR/dotnet" <<'STUB'
+#!/bin/bash
+if [ "$1" = "--version" ]; then
+    # Model a pin that silently does not take effect.
+    if [ -f "$PWD/global.json" ]; then echo "9.0.100"; else echo "10.0.100"; fi
+    exit 0
+fi
+if [ "$1" = "new" ] && [ "$2" = "globaljson" ]; then
+    printf '{"sdk":{"version":"x"}}' > "$PWD/global.json"; exit 0
+fi
+case "$1" in
+    --list-sdks) echo "10.0.100 [$(dirname "$0")/sdk]" ;;
+    workload)    echo "REACHED_INSTALL"; exit 0 ;;
+    *)           exit 0 ;;
+esac
+STUB
+chmod +x "$PINDIR/dotnet"
+
+if curl -sSf -m 20 -o /dev/null https://api.nuget.org/v3/index.json 2>/dev/null; then
+    pin_out="$(cd "$TMPROOT" && bash "$SH_SCRIPT" -d "$PINDIR" 2>&1)"; pin_rc=$?
+    if [[ $pin_rc -ne 0 ]] && grep -q "pin did not take effect" <<< "$pin_out" && ! grep -q "REACHED_INSTALL" <<< "$pin_out"; then
+        printf "  %sPASS%s  ineffective SDK pin aborts before install\n" "$c_green" "$c_reset"
+        pass=$((pass + 1))
+    else
+        printf "  %sFAIL%s  ineffective SDK pin did not abort (exit %s)\n" "$c_red" "$c_reset" "$pin_rc"
+        echo "$pin_out" | tail -5 | sed 's/^/        | /'
+        fail=$((fail + 1))
+    fi
+
+    # A pin that DOES take effect must install normally.
+    PINOK="$TMPROOT/pinok"
+    mkdir -p "$PINOK"
+    cat > "$PINOK/dotnet" <<'STUB'
+#!/bin/bash
+case "$1" in
+    --version)   echo "10.0.100" ;;
+    --list-sdks) echo "10.0.100 [$(dirname "$0")/sdk]" ;;
+    new)         exit 0 ;;
+    workload)    exit 0 ;;
+    *)           exit 0 ;;
+esac
+STUB
+    chmod +x "$PINOK/dotnet"
+    ok_out="$(cd "$TMPROOT" && bash "$SH_SCRIPT" -d "$PINOK" 2>&1)"; ok_rc=$?
+    if [[ $ok_rc -eq 0 ]] && grep -q "^DONE$" <<< "$ok_out"; then
+        printf "  %sPASS%s  effective SDK pin installs normally\n" "$c_green" "$c_reset"
+        pass=$((pass + 1))
+    else
+        printf "  %sFAIL%s  effective SDK pin failed (exit %s)\n" "$c_red" "$c_reset" "$ok_rc"
+        echo "$ok_out" | tail -5 | sed 's/^/        | /'
+        fail=$((fail + 1))
+    fi
+else
+    printf "  %sSKIP%s  SDK pin verification (no network)\n" "$c_yellow" "$c_reset"
+fi
+
+# --- 10. empty feed response must not install "latest" -------------------------
+#
+# The NuGet v2 package endpoint serves the LATEST version when the URL carries no version
+# segment, so an empty resolved version must never reach the download step.
+
+echo ""
+echo "-- empty version never reaches the download URL --"
+
+if grep -q 'Refusing to install: resolved an empty manifest id/version' "$SH_SCRIPT"; then
+    printf "  %sPASS%s  workload-install.sh guards against an empty resolved version\n" "$c_green" "$c_reset"
+    pass=$((pass + 1))
+else
+    printf "  %sFAIL%s  workload-install.sh has no empty-version guard\n" "$c_red" "$c_reset"
+    fail=$((fail + 1))
+fi
+
+if command -v pwsh >/dev/null 2>&1; then
+    # An empty versions[] must NOT yield a truthy "<id>=" result.
+    cat > "$TMPROOT/empty-versions.ps1" <<'PSEOF'
+param([string]$ScriptPath)
+$src = Get-Content -Raw $ScriptPath
+if ($src -match 'Where-Object \{ \$_ -and \$_\.Trim\(\) \} \| Select-Object -Last 1') {
+    Write-Output 'GUARDED'
+} else {
+    Write-Output 'UNGUARDED'
+}
+if ($src -match 'IsNullOrWhiteSpace\(\$ResolvedVersion\)') {
+    Write-Output 'CALLER_GUARDED'
+} else {
+    Write-Output 'CALLER_UNGUARDED'
+}
+PSEOF
+    ev="$(pwsh -NoProfile -File "$TMPROOT/empty-versions.ps1" -ScriptPath "$PS1_SCRIPT" 2>/dev/null | tr -d '\r')"
+    for want in GUARDED CALLER_GUARDED; do
+        if grep -Fqx "$want" <<< "$ev"; then
+            printf "  %sPASS%s  ps1 %s\n" "$c_green" "$c_reset" "$want"
+            pass=$((pass + 1))
+        else
+            printf "  %sFAIL%s  ps1 missing %s\n" "$c_red" "$c_reset" "$want"
+            fail=$((fail + 1))
+        fi
+    done
+fi
+
 echo ""
 echo "============= install-failure summary ============="
 echo "  passed: $pass"

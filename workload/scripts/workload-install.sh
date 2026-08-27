@@ -257,6 +257,11 @@ function install_tizenworkload() {
         fi
     fi
 
+    if [ -z "$MANIFEST_VERSION" ] || [ -z "$MANIFEST_NAME" ]; then
+        echo "Refusing to install: resolved an empty manifest id/version for $DOTNET_VERSION."
+        return 1
+    fi
+
     # Check workload manifest directory.
     SDK_MANIFESTS_DIR="$DOTNET_INSTALL_DIR/sdk-manifests/$DOTNET_TARGET_VERSION_BAND"
     ensure_directory "$SDK_MANIFESTS_DIR"
@@ -299,13 +304,40 @@ function install_tizenworkload() {
     else
         CACHE_GLOBAL_JSON="false"
     fi
-    dotnet new globaljson --sdk-version $DOTNET_VERSION
+    # Pin the SDK for the install. Use the dotnet under test - not whatever 'dotnet' the
+    # PATH resolves to - and CHECK the result: this function is invoked under `if !`, which
+    # disables errexit for everything it calls, so an unchecked failure here would leave the
+    # workload to be installed against the wrong SDK.
+    if ! "$DOTNET_INSTALL_DIR/dotnet" new globaljson --sdk-version "$DOTNET_VERSION" --force; then
+        echo "Failed to pin SDK $DOTNET_VERSION via global.json."
+        rm -f global.json
+        if [[ "$CACHE_GLOBAL_JSON" == "true" ]]; then mv global.json.bak global.json; fi
+        return 1
+    fi
+
+    # Verify the pin actually took effect before installing anything.
+    EFFECTIVE_VERSION="$("$DOTNET_INSTALL_DIR/dotnet" --version 2>/dev/null)"
+    if [ "$EFFECTIVE_VERSION" != "$DOTNET_VERSION" ]; then
+        echo "SDK pin did not take effect: requested $DOTNET_VERSION, active ${EFFECTIVE_VERSION:-<unknown>}."
+        rm -f global.json
+        if [[ "$CACHE_GLOBAL_JSON" == "true" ]]; then mv global.json.bak global.json; fi
+        return 1
+    fi
+
+    EFFECTIVE_BAND="$(compute_target_version_band "$EFFECTIVE_VERSION")"
+    if [ "$EFFECTIVE_BAND" != "$DOTNET_TARGET_VERSION_BAND" ]; then
+        echo "Band mismatch: manifest installed for $DOTNET_TARGET_VERSION_BAND but the active SDK resolves to $EFFECTIVE_BAND."
+        rm -f global.json
+        if [[ "$CACHE_GLOBAL_JSON" == "true" ]]; then mv global.json.bak global.json; fi
+        return 1
+    fi
+
     "$DOTNET_INSTALL_DIR/dotnet" workload install tizen --skip-manifest-update
     local install_status=$?
 
     # Clean-up
     rm -fr "$TMPDIR"
-    rm global.json
+    rm -f global.json
     if [[ "$CACHE_GLOBAL_JSON" == "true" ]]; then
         mv global.json.bak global.json
     fi

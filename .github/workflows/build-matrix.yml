@@ -78,6 +78,9 @@ jobs:
     - name: Run test-package-fallback.sh
       run: bash workload/scripts/test-package-fallback.sh
 
+    - name: Run test-release-workflow.sh
+      run: bash workload/scripts/test-release-workflow.sh
+
     - name: Run test-install-failure.sh
       run: bash workload/scripts/test-install-failure.sh
 

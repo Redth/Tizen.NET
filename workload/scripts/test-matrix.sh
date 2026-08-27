@@ -254,7 +254,11 @@ if [[ -z "$ONLY" && $pass_count -gt 0 ]]; then
     rm -rf "$sc_dir" && mkdir -p "$sc_dir"
     # Reuse whichever row built successfully; any Tizen project will do.
     src_row="$(find "$TMPDIR" -maxdepth 1 -name 'net*-tizen*' -type d | head -1)"
-    if [[ -n "$src_row" ]]; then
+    if [[ -z "$src_row" ]]; then
+        fail "self-contained disposition could not run (no built row to reuse)"
+        fail_count+=1
+        failed_rows+=("selfcontained:no-fixture")
+    else
         cp "$src_row/TizenApp1.csproj" "$src_row/tizen-manifest.xml" "$sc_dir/" 2>/dev/null
         cp -r "$src_row"/*.cs "$sc_dir/" 2>/dev/null
         sc_log="$sc_dir/selfcontained.log"
@@ -271,8 +275,13 @@ if [[ -z "$ONLY" && $pass_count -gt 0 ]]; then
             fail_count+=1
             failed_rows+=("selfcontained:xmlexception")
         else
-            warn "self-contained failed before reaching the Tizen guard (see $sc_log)"
-            grep -m2 "error" "$sc_log" | sed 's/^/      | /'
+            # Any other diagnostic is a FAILURE, not a warning. Self-contained has exactly one
+            # supported outcome; NETSDK1083 or anything else means the guard did not fire and
+            # the user gets an unactionable error.
+            fail "self-contained produced an unexpected diagnostic (expected TIZENSDK001)"
+            grep -m3 "error" "$sc_log" | sed 's/^/      | /'
+            fail_count+=1
+            failed_rows+=("selfcontained:unexpected-diagnostic")
         fi
     fi
 fi

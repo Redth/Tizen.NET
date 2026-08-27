@@ -74,8 +74,9 @@ eventual `11.0.100` GA need no further code change. This is asserted by
 | `test-matrix-self-test` | matrix row selection (an over-strict check silently builds nothing) |
 | `test-version-band` | SDK version → feature band across **both installers and Config.mk**, fallback band family, band isolation |
 | `test-template-conditions` | template platform detection across TFMs |
-| `test-package-fallback` | `PackageTargetFallback` compatibility filtering, incl. negative cross-platform/version cases |
-| `test-install-failure` | installers exit non-zero on failure; fallback resolves package **id**, no cross-SDK leakage |
+| `test-package-fallback` | fallback filtering, plus selection priority / atomicity in both directory-creation orders |
+| `test-release-workflow` | release ordering, retryability, non-mutating reference-only runs |
+| `test-install-failure` | installer exit codes, fallback package **id**, SDK-pin verification, empty/transport responses |
 | `Generate-InstallScripts.ps1 -Check` | version-map drift **and** install-script integrity |
 
 `make check` requires `pwsh` for the last row. If it is unavailable the target fails with an
@@ -121,6 +122,18 @@ Two properties are load-bearing:
 
 An 11.x request with no 11.x map entry fails closed.
 
+The resolved version is validated before use. An empty or all-blank `versions[]` from the feed
+is rejected rather than returned as a truthy `"<id>="`: the NuGet v2 package endpoint serves the
+**latest** version when given a versionless URL, so an empty version would silently install an
+arbitrary package. Both installers fall through to the version map and then fail closed.
+
+The SDK pin is verified before anything is installed. `install_tizenworkload` is invoked under
+`if !`, which disables `errexit` for everything it calls, so an unchecked
+`dotnet new globaljson` previously let the install proceed against whatever SDK `PATH` resolved.
+The pin now uses the dotnet under test, its exit status is checked, and the **effective**
+`dotnet --version` and feature band are re-verified against the requested ones before any pack
+is installed.
+
 Note the installer must run under **bash 3.2** (macOS ships it and is a supported target, see
 `DOTNET_DEFAULT_PATH_MACOS`). The `${var,,}` lowercase expansion is bash 4+ and raised
 `bad substitution` there, leaving the version empty and silently skipping the fallback
@@ -142,6 +155,15 @@ highest-first so the best compatible match wins the task's first-wins selection.
 The filter is built from conditional **properties**, not filtered items: MSBuild evaluates all
 top-level properties before any items, so a property referencing `@(item)` at that level
 silently expands to nothing.
+
+`PackageTargetFallback` is an **ordered preference list**, and `FixupNuGetReferences` honours
+that order: it ranks candidates by their position in the list and selects exactly **one**
+fallback TFM per package, taking every substituted assembly from that single directory. It
+previously collected all matching directories into an unordered `HashSet` populated in
+filesystem-enumeration order and then took assemblies first-wins across them, which could both
+ignore the declared priority and mix assemblies from different TFMs within one package.
+`scripts/test-package-fallback.sh` builds the candidate directories in **both** creation orders
+so the assertion does not depend on how a particular filesystem enumerates.
 
 Check C8 verifies the candidate list covers the full (.NET major × platform) cross-product
 *and* that every candidate carries a compatibility condition;
@@ -277,3 +299,24 @@ fixes are correct regardless of which error surfaces first.
 
 Check C6 now parses the file with a real XML parser and asserts the `TIZENSDK001` guard exists;
 `test-matrix.sh` additionally asserts the runtime disposition end to end.
+
+## Release retryability
+
+The release workflow is ordered so a failure is always retryable:
+
+1. resolve the version (no mutation yet),
+2. clean, build, and **verify** the expected artifacts on disk,
+3. only then commit and push the version bump,
+4. push packages from the verified staging directory,
+5. create the tag, targeting the commit that carries the released `Versions.props`.
+
+Committing the bump *before* the build meant a later failure left the branch already bumped, so
+the retry computed `OLD == NEW` and aborted — an unretryable release. `OLD == NEW` is therefore
+no longer an error: `next-workload-version.py` derives the next version from what is published
+on NuGet, so when the branch already carries the intended still-unpublished version the run
+**resumes** it. Re-creating an existing tag is a no-op.
+
+A reference-only run (`release_manifest=false`) publishes no manifest and is completely
+non-mutating: no bump, no commit, no tag.
+
+`scripts/test-release-workflow.sh` pins all of the above.

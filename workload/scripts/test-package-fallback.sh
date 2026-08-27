@@ -108,6 +108,110 @@ for case in "${CASES[@]}"; do
     fi
 done
 
+# --- selection priority + atomicity ------------------------------------------
+#
+# PackageTargetFallback is an ORDERED preference list, but FixupNuGetReferences used to add
+# every matching directory to an unordered HashSet (populated in FILESYSTEM enumeration
+# order) and then take assemblies first-wins across all of them. Two consequences:
+#   * the declared priority was ignored whenever it disagreed with directory order, and
+#   * assemblies could be MIXED across TFMs within one package.
+#
+# The cases below are chosen so alphabetical directory order DISAGREES with the declared
+# priority - otherwise the old implementation passes by luck.
+
+echo ""
+echo "-- selection priority / atomicity --"
+
+TASK_PROJ="$WORKLOAD_DIR/src/Samsung.Tizen.Build.Tasks/Samsung.Tizen.Build.Tasks.csproj"
+TASK_DLL="$WORKLOAD_DIR/src/Samsung.Tizen.Build.Tasks/bin/Release/netstandard2.0/Samsung.Tizen.Build.Tasks.dll"
+
+if [[ ! -f "$TASK_DLL" ]]; then
+    "$DOTNET" build "$TASK_PROJ" -c Release --nologo -v:q >/dev/null 2>&1 || true
+fi
+
+# "<label>|<priority list>|<dirs to create>|<expected winner>|<dirs that get Extras.dll>"
+#
+# 'priority' mirrors what the SDK emits for the project being built (highest first).
+# Alphabetically net6.0-tizen8.0 sorts BEFORE net9.0-tizen9.0, so a filesystem-ordered
+# implementation picks the wrong one here.
+PRIORITY_CASES=(
+    "priority beats dir order|net9.0-tizen9.0;net6.0-tizen8.0|net9.0-tizen9.0 net6.0-tizen8.0|net9.0-tizen9.0|net9.0-tizen9.0 net6.0-tizen8.0"
+    "no mixing across TFMs|net9.0-tizen9.0;net6.0-tizen8.0|net9.0-tizen9.0 net6.0-tizen8.0|net9.0-tizen9.0|net6.0-tizen8.0"
+    "mid-priority wins|net8.0-tizen10.0;net6.0-tizen8.0|net8.0-tizen10.0 net6.0-tizen8.0|net8.0-tizen10.0|net8.0-tizen10.0 net6.0-tizen8.0"
+)
+
+if [[ ! -f "$TASK_DLL" ]]; then
+    printf "  %sSKIP%s  task assembly unavailable (build failed)\n" "$c_yellow" "$c_reset"
+else
+    ci=0
+    for case in "${PRIORITY_CASES[@]}"; do
+        IFS='|' read -r label priority dirs want extras <<< "$case"
+
+        # Directory enumeration order is filesystem-dependent (observed here as reverse
+        # creation order). Rather than depend on it, run each case in BOTH creation orders:
+        # whichever way the filesystem enumerates, one of the two runs presents a
+        # lower-priority directory first. An implementation that follows enumeration order
+        # instead of the declared priority must fail at least one of them.
+        for order in forward reverse; do
+            ci=$((ci + 1))
+            pkgroot="$TMPDIR/pkg$ci/lib"
+            rm -rf "$pkgroot"; mkdir -p "$pkgroot/netstandard2.0"
+            printf 'netstandard2.0' > "$pkgroot/netstandard2.0/Contoso.dll"
+            printf 'netstandard2.0' > "$pkgroot/netstandard2.0/Contoso.Extras.dll"
+
+            if [[ "$order" == "forward" ]]; then
+                ordered="$dirs"
+            else
+                ordered="$(echo "$dirs" | tr ' ' '\n' | sed '1!G;h;$!d' | tr '\n' ' ')"
+            fi
+
+            for d in $ordered; do
+                [[ -z "$d" ]] && continue
+                mkdir -p "$pkgroot/$d"
+                printf '%s' "$d" > "$pkgroot/$d/Contoso.dll"
+                case " $extras " in *" $d "*) printf '%s' "$d" > "$pkgroot/$d/Contoso.Extras.dll" ;; esac
+            done
+
+            cat > "$TMPDIR/fixup$ci.proj" <<PROJEOF
+<Project>
+  <UsingTask TaskName="Samsung.Tizen.Build.Tasks.FixupNuGetReferences" AssemblyFile="$TASK_DLL" />
+  <Target Name="Probe">
+    <ItemGroup>
+      <CopyLocal Include="$pkgroot/netstandard2.0/Contoso.dll" />
+      <CopyLocal Include="$pkgroot/netstandard2.0/Contoso.Extras.dll" />
+    </ItemGroup>
+    <Samsung.Tizen.Build.Tasks.FixupNuGetReferences
+        PackageTargetFallback="$priority"
+        CopyLocalItems="@(CopyLocal)">
+      <Output TaskParameter="AssembliesToAdd" ItemName="Added" />
+    </Samsung.Tizen.Build.Tasks.FixupNuGetReferences>
+    <Message Importance="high" Text="ADDED|@(Added)" />
+  </Target>
+</Project>
+PROJEOF
+
+            out="$("$DOTNET" msbuild "$TMPDIR/fixup$ci.proj" -t:Probe -nologo -v:m 2>&1 | grep -o 'ADDED|.*' | head -1)"
+            added="${out#ADDED|}"
+            bad=0; seen=""
+            [[ -z "$added" ]] && bad=1
+            IFS=';' read -ra items <<< "$added"
+            for a in "${items[@]+"${items[@]}"}"; do
+                [[ -z "$a" ]] && continue
+                tfmdir="$(basename "$(dirname "$a")")"
+                seen="$seen $tfmdir"
+                [[ "$tfmdir" != "$want" ]] && bad=1
+            done
+            if [[ $bad -eq 0 ]]; then
+                printf "  %sPASS%s  %-28s [%-7s] all from %s\n" "$c_green" "$c_reset" "$label" "$order" "$want"
+                pass=$((pass + 1))
+            else
+                printf "  %sFAIL%s  %-28s [%-7s] expected only %s, saw:%s\n" "$c_red" "$c_reset" "$label" "$order" "$want" "${seen:- <none>}"
+                fail=$((fail + 1))
+            fi
+        done
+    done
+fi
+
 echo ""
 echo "=========== package-fallback summary ==========="
 echo "  passed: $pass"

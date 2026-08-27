@@ -37,42 +37,45 @@ jobs:
           --store-password-in-clear-text \
           --configfile workload/NuGet.config
 
-    - name: Bump TizenWorkloadVersion (global sequential, NuGet-derived)
+    # Resolve the version to release.
+    #
+    # Two properties matter here:
+    #  * A reference-only run (release_manifest=false) publishes no manifest, so it must be
+    #    completely NON-MUTATING - no bump, no commit, no tag.
+    #  * OLD == NEW is NOT necessarily an error. next-workload-version.py derives the next
+    #    version from what is published on NuGet, so if a previous run already bumped and
+    #    pushed but failed before publishing, the branch legitimately carries the intended
+    #    (still unpublished) version. That case must RESUME, not abort - otherwise a failed
+    #    release can never be retried.
+    - name: Resolve release version
       id: bump
       working-directory: ./workload
       run: |
-        set -e
+        set -euo pipefail
         OLD=$(grep -oP '(?<=<TizenWorkloadVersion>)[^<]+(?=</TizenWorkloadVersion>)' build/Versions.props)
         NEW=$(python3 scripts/next-workload-version.py)
         echo "Current: $OLD"
         echo "Next:    $NEW"
-        if [ "$OLD" = "$NEW" ]; then
-            echo "ERROR: computed next == current. NuGet already has this version published."
-            exit 1
+
+        if [ "${{ github.event.inputs.release_manifest }}" != "true" ]; then
+          echo "::notice ::Reference-only run: leaving TizenWorkloadVersion at $OLD (non-mutating)."
+          echo "workload_version=$OLD" >> "$GITHUB_OUTPUT"
+          echo "mutated=false" >> "$GITHUB_OUTPUT"
+          exit 0
         fi
+
+        if [ "$OLD" = "$NEW" ]; then
+          # The branch already holds the version NuGet does not have yet: resume it.
+          echo "::notice ::Resuming release of $OLD (already set on this branch, not yet published)."
+          echo "workload_version=$OLD" >> "$GITHUB_OUTPUT"
+          echo "mutated=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
         python3 scripts/next-workload-version.py --apply --verbose
         echo "workload_version=$NEW" >> "$GITHUB_OUTPUT"
+        echo "mutated=true" >> "$GITHUB_OUTPUT"
         echo "::notice ::Bumped TizenWorkloadVersion: $OLD -> $NEW"
-
-    # Persist the bump. Without this the tag created below points at a commit whose
-    # Versions.props still holds the PREVIOUS version, so the released sources do not
-    # correspond to the published package versions.
-    - name: Commit and push the version bump
-      run: |
-        set -e
-        BRANCH="${GITHUB_REF_NAME}"
-        VER="${{ steps.bump.outputs.workload_version }}"
-        if git diff --quiet -- workload/build/Versions.props; then
-          echo "::error::Versions.props was not modified by the bump step."
-          exit 1
-        fi
-        git config user.name  "github-actions[bot]"
-        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-        git add workload/build/Versions.props
-        git commit -m "chore: bump TizenWorkloadVersion to ${VER}"
-        git push origin "HEAD:${BRANCH}"
-        echo "release_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-      id: commit
 
     - name: Install Wix toolset
       run: sudo apt-get install -y wixl
@@ -124,6 +127,34 @@ jobs:
         echo "manifest_pkg=$MANIFEST_PKG" >> "$GITHUB_OUTPUT"
         echo "Staged packages:"; ls -1 "$STAGING"
 
+    # Persist the bump only AFTER the build succeeded and the expected artifacts were
+    # verified on disk. Committing earlier meant a later build failure left the branch
+    # already bumped, so the retry computed OLD == NEW and aborted - an unretryable release.
+    #
+    # Skipped when the resolve step did not mutate anything (reference-only run, or a resume
+    # of a version this branch already carries).
+    - name: Commit and push the version bump
+      id: commit
+      run: |
+        set -euo pipefail
+        BRANCH="${GITHUB_REF_NAME}"
+        VER="${{ steps.bump.outputs.workload_version }}"
+        if [ "${{ steps.bump.outputs.mutated }}" != "true" ]; then
+          echo "::notice ::No version mutation to persist; tagging existing HEAD."
+          echo "release_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        if git diff --quiet -- workload/build/Versions.props; then
+          echo "::error::Versions.props was not modified by the resolve step."
+          exit 1
+        fi
+        git config user.name  "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git add workload/build/Versions.props
+        git commit -m "chore: bump TizenWorkloadVersion to ${VER}"
+        git push origin "HEAD:${BRANCH}"
+        echo "release_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
     - name: Push Manifest/SDK/Runtime packs
       if: ${{ github.event.inputs.release_manifest == 'true' }}
       run: |
@@ -159,6 +190,7 @@ jobs:
                       -t 3000 \
                       --skip-duplicate
 
+    # Idempotent: a resumed run whose tag already exists must not fail the whole release.
     - name: Create GitHub Release
       if: ${{ github.event.inputs.release_manifest == 'true' }}
       env:
@@ -187,6 +219,10 @@ jobs:
             [ -n "$v" ] && echo "- https://www.nuget.org/packages/Samsung.Tizen.Ref.API${api}/${v}"
           done
         } > "$RUNNER_TEMP/release-notes.md"
+        if gh release view "v${VER}" >/dev/null 2>&1; then
+          echo "::notice ::Release v${VER} already exists; skipping creation (resumed run)."
+          exit 0
+        fi
         gh release create "v${VER}" \
           --target "${{ steps.commit.outputs.release_sha }}" \
           --title "Tizen Workload ${VER} - .Net ${MAJOR_MINOR}" \
