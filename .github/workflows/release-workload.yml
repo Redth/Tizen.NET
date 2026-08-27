@@ -147,11 +147,13 @@ jobs:
           exit 1
         fi
         cp "${pkgs[@]}" "$STAGING/"
-        SDK="${{ github.event.inputs.net_sdk_version }}"
-        # Reuse the band function from workload-install.sh so the release cannot
-        # disagree with what the installer will look for.
-        eval "$(sed -n '/# BEGIN VERSION BAND DETECTION/,/# END VERSION BAND DETECTION/p' workload/scripts/workload-install.sh)"
-        BAND="$(compute_target_version_band "$SDK")"
+        # Single source: the band the resolve step already computed (via the installer's
+        # own function). Recomputing it here would be a second place to drift.
+        BAND="${{ steps.bump.outputs.band }}"
+        if [ -z "$BAND" ]; then
+          echo "::error::Resolve step did not publish a band output."
+          exit 1
+        fi
         echo "Resolved SDK feature band: $BAND"
         if ! ls "$STAGING/Samsung.NET.Sdk.Tizen.Manifest-$BAND."*.nupkg >/dev/null 2>&1; then
           echo "::error::No Samsung.NET.Sdk.Tizen.Manifest-$BAND package was produced."

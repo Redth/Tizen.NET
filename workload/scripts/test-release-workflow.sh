@@ -140,6 +140,39 @@ assert "publication completeness is verified before tagging" \
 assert "every push is idempotent (--skip-duplicate)" \
     "$([[ "$(grep -c 'skip-duplicate' "$WF")" -ge 3 ]] && echo 1 || echo 0)"
 
+# --- resume set must match what the workflow actually publishes --------------
+#
+# release-state.py decides whether a version is fully published. If a pack is added to the
+# push steps but not to that list, a version missing it would be reported "published", get
+# tagged, and never be completed - the exact failure this machinery exists to prevent.
+
+assert "band is computed in exactly one place" \
+    "$([[ "$(grep -c 'compute_target_version_band' "$WF")" -eq 1 ]] && echo 1 || echo 0)"
+
+STATE_PKGS="$(python3 - "$WORKLOAD_DIR/scripts/release-state.py" <<'PYEOF'
+import re, sys
+src = open(sys.argv[1], encoding="utf-8").read()
+block = re.search(r"VERSIONED_PACKAGE_SUFFIXES = \[(.*?)\]", src, re.S).group(1)
+print("\n".join(sorted(re.findall(r'"([^"]+)"', block))))
+PYEOF
+)"
+
+# Package globs the workflow pushes under the workload version (excludes the Ref packs,
+# which are versioned by TizenFX and gated by release_reference).
+PUSHED="$(grep -oE '\$pattern|for pattern in [^;]*' "$WF" | sed -n 's/^for pattern in //p' | tr ' ' '\n' | sed '/^$/d' | sort -u)"
+
+norm() { sed 's/^Samsung\.NETCore\.App\.Runtime$/Samsung.NETCore.App.Runtime.tizen/' ; }
+missing_from_state=""
+while read -r pkg; do
+    [[ -z "$pkg" ]] && continue
+    canonical="$(echo "$pkg" | norm)"
+    grep -Fqx "$canonical" <<< "$STATE_PKGS" || missing_from_state="$missing_from_state $canonical"
+done <<< "$PUSHED"
+
+assert "every pushed pack is tracked by release-state.py" \
+    "$([[ -z "$missing_from_state" ]] && echo 1 || echo 0)"
+[[ -n "$missing_from_state" ]] && echo "        untracked:$missing_from_state"
+
 # --- failure injection against the real state script -------------------------
 #
 # Simulates a release interrupted at each step, using a local file:// feed, and asserts the
